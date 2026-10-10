@@ -12,6 +12,7 @@ and guarded.
 | `aarch64_qemu_run.sh` | PC | run the real aarch64 binary under qemu user mode with a Debian arm64 sysroot, on a private Xvfb |
 | `keyd.py` | device (or a test machine) | uinput virtual keyboard fed from a FIFO |
 | `device.sh` | PC, talks to the device | drive the port through EmulationStation's HTTP API, framebuffer screenshots, logs. Refuses to run without `DEVICE_OK=1` |
+| `cursor_test.sh` | PC | headless pixel test of the software cursor (optional patch 0100) and of the AS2 and AS3 overlay snippets |
 | `fixtures/` | | tiny generated test movies, see `fixtures/README.md` |
 
 ## The no desktop window rules
@@ -93,6 +94,29 @@ ruffle_sdl before the SWF path, for example `--stage-scale movie --quality low -
 
 A binary without the hooks still runs (useful for exit code and relaunch marker tests), it just
 produces no screenshots.
+
+## cursor_test.sh
+
+```
+tests/cursor_test.sh <ruffle_sdl> [out_dir]
+PLAIN_BIN=<hooked build without patch 0100> FFDEC=<ffdec> RUFFLE_SRC=<ruffle tree> tests/cursor_test.sh <ruffle_sdl>
+```
+
+Checks the software cursor of optional patch 0100 (`ruffle/optional`) without any window on your
+desktop. The binary must be built from a tree with the series, the optional patch and
+`sdl_test_hooks.py`. It runs `pc_sdl_run.sh` (headless) on the still movie
+`fixtures/test_static.swf` and takes three captures: before any motion, shortly after the pointer
+was moved, and after the idle time. The pointer is moved with `xdotool` on the private Xvfb only:
+`pc_sdl_run.sh` starts a small wrapper in place of the binary, the wrapper refuses to run unless
+`DISPLAY` is a private display, starts the mover and execs the real binary. The PNGs are decoded in
+python (zlib, no PIL) and compared pixel by pixel: arrow pixels must appear with the tip at the
+pointer, and the capture after the idle time must be identical to the first. Cases: default arrow,
+the `--sw-cursor` flag with `--render-size` and `RUFFLE_SW_CURSOR_SIZE`, a PNG image (exactly 64
+magenta pixels for an 8 by 8 image), switched off (identical to before, and to `PLAIN_BIN` when
+given), the animated movie (the animation keeps running, no GL error), the SDL colour cursor
+switch (creation only, the video driver draws that cursor, not the GL frame), and the AS2 and AS3
+overlay snippets compiled with ffdec (skipped when `FFDEC` or `RUFFLE_SRC` is missing). The exit
+code is non zero if any case fails, and failed cases keep their captures in the output folder.
 
 ## gamescope_headless.sh
 

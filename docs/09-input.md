@@ -114,41 +114,51 @@ The template `templates/port/MYPORT/MYPORT.gptk` has these lines commented out, 
 
 ## Software cursor: every implementation
 
-Five approaches exist or are planned. They can be combined. Each has a status line that is kept up to date by the toolkit maintainers.
+Five approaches exist. They can be combined. Each has a status line: verified headless (with what exactly), implemented not verified, or documented only. "Headless" here means ruffle_sdl on a private Xvfb with Mesa software GL, driven by `tests/cursor_test.sh`. Nothing was run on a handheld yet.
 
 ### 1. Front end overlay (optional patch 0100)
 
-A GL quad drawn by `ruffle_sdl` after Ruffle's frame. Shown after mouse motion, hidden after an idle time.
+A small arrow drawn by `ruffle_sdl` as one GLES 3.0 quad after the movie is blitted and before the buffer swap, in window pixels (so `--render-size` and letterboxing do not matter). Shown after SDL mouse motion, hidden after an idle time, zero work while hidden. The GL state it touches is saved and restored because wgpu owns the context. The built in arrow is generated in code (no asset), `RUFFLE_SW_CURSOR_IMAGE` replaces it with a PNG.
 
 * Patch: `ruffle/optional/0100-ruffle_sdl-software-cursor-overlay.patch` (applied with `WITH_OPTIONAL="0100" ruffle/fetch.sh`).
 * Switches: `RUFFLE_SW_CURSOR` (default 0, 1 enables), `RUFFLE_SW_CURSOR_IDLE_MS` (default 2000), `RUFFLE_SW_CURSOR_SIZE` (pixels, default 24), `RUFFLE_SW_CURSOR_IMAGE` (optional PNG path), and the `--sw-cursor` CLI flag.
 * Works for every movie, needs no shell patch, not tied to the AVM version.
 
-Status: planned (not yet verified here)
+How to use:
+
+1. Build with the patch: `WITH_OPTIONAL="0100" ruffle/fetch.sh work/ruffle-src`, then the usual build script. It adds one `png` dependency line to `sdl/Cargo.toml` (`png` is already in Ruffle's lockfile).
+2. Export `RUFFLE_SW_CURSOR=1` in the port's launcher or cfg (or pass `--sw-cursor`). Optional: `RUFFLE_SW_CURSOR_IDLE_MS=3000`, `RUFFLE_SW_CURSOR_SIZE=32` on a larger screen.
+3. Give the pointer a source: approach 5 below.
+
+Status: verified headless (x86_64 build, Xvfb, Mesa llvmpipe GLES 3.2, `tests/cursor_test.sh`). A pointer moved with xdotool makes a 15 by 24 pixel arrow (224 pixels differ from the frame before: 51 white, 131 black, the rest anti aliased edge) with its tip on the pointer; after the idle time the capture is identical to the one before the motion. Also verified: the `--sw-cursor` flag with `--render-size 320x180` letterboxed and a 40 pixel arrow (25 by 40 pixels at the pointer), a PNG image (an 8 by 8 magenta PNG gives exactly 64 magenta pixels at the pointer), the cursor over an animated movie (the animation keeps running, no GL error), and with `RUFFLE_SW_CURSOR` unset the output is pixel identical to a binary without the patch. Not verified: on a handheld GPU (Mali, Panfrost), on KMSDRM or fbdev, and under SDL 2.0.10 (the patch uses only GLES 3.0 and old SDL calls, but it has not been run there).
 
 ### 2. SDL colour cursor
 
 `SDL_CreateColorCursor` as a fallback inside the same patch, enabled with `RUFFLE_SDL_CURSOR=1`. It only works where the video driver draws cursors (X11, Wayland, some DRM stacks). On a bare framebuffer or KMSDRM EGL setup it normally shows nothing.
 
-Status: planned (not yet verified here)
+How to use: `RUFFLE_SDL_CURSOR=1` (with or without `RUFFLE_SW_CURSOR`, usually one or the other). It uses the same bitmap and size variables. Do not expect it on handhelds: SDL only shows a colour cursor where the video driver draws one.
+
+Status: implemented, creation verified headless (the log line `SDL colour cursor on` appears and the player runs normally). That it becomes visible is not verified: an SDL cursor is drawn by the video driver, not into the GL frame, so the capture hook cannot see it, and it needs a desktop session or a device to look at.
 
 ### 3. Shell side AS3 overlay
 
-A Sprite added at the top of the display list that follows the stage mouse and hides after idle. Snippet: `tools/swf/snippets/cursor_overlay.as3.txt`, applied through the shell patch step (see [02](02-shell-patching.md)).
+A Sprite added at the top of the stage that follows the mouse, is shown on `MOUSE_MOVE` and hidden by a timer after the idle time. `mouseEnabled` and `mouseChildren` are false, so it never takes a click. Snippet: `tools/swf/snippets/cursor_overlay.as3.txt`, added through the shell patch step (see [02](02-shell-patching.md): `anchor.py` for the insertion, `ffdec.sh replace-as3` for the one class). A Ruffle detail: inside a mouse move handler `stage.mouseX` still holds the previous event's position, so the snippet uses `e.stageX` and `e.stageY`.
 
-Status: planned (not yet verified here)
+Status: verified headless. The snippet was compiled with ffdec into the document class of a minimal AS3 movie and run on Xvfb: 196 pixels of arrow (15 by 24, tip on the pointer) after motion, identical to the first capture after the idle time. Not tried in a real game shell (which may add children to the stage later, or sit behind a loader sandbox) or on a device.
 
 ### 4. Shell side AS2 variant
 
-The same idea in AS2, written to be P-code friendly: a movie clip at a high depth with `onMouseMove`, hidden by a frame counter. Snippet: `tools/swf/snippets/cursor_overlay.as2.txt`.
+The same idea in AS2: a movie clip drawn with the drawing API at a depth of 2000000, `Mouse.addListener` with `onMouseMove`, hidden after the idle time. It follows the pointer every frame, because in Ruffle `_xmouse` inside `onMouseMove` is one event old. Snippet: `tools/swf/snippets/cursor_overlay.as2.txt`. ffdec compiles it from source (`ffdec.sh raw -replace in.swf out.swf /frame_1/DoAction overlay.as`), or the exported P-code can be copied in by hand (see [02](02-shell-patching.md)).
 
-Status: planned (not yet verified here)
+Status: verified headless. Compiled with ffdec into a one frame AVM1 movie and run on Xvfb: 143 pixels of arrow (13 by 20, tip on the pointer) after motion, identical to the first capture after the idle time. Not tried in a real AS2 game (depth and scaling conflicts are the usual trouble, see the notes in the snippet) or on a device.
 
 ### 5. gptokeyb pointer source
 
 Right stick to `mouse_movement_*` plus R1 and R2 as clicks (above). This only produces pointer motion. It needs one of 1 to 4 to be visible. It is the one piece that every other approach depends on when the user has no touch screen or mouse.
 
-Status: mapping known to inject REL events into gptokeyb's virtual device (verified by a test harness); no end to end run with a visible cursor yet
+The pair that needs no shell patch is 5 with 1: gptokeyb's virtual mouse is a uinput device, SDL receives it as `MouseMotion`, and approach 1 draws the arrow on exactly that event. Approach 5 works with 3 and 4 too (the movie sees the same mouse events), and with 2 only where the driver draws a cursor. The commented mouse block in `templates/port/MYPORT/MYPORT.gptk` is consistent with this: same `mouse_movement_*` lines and `mouse_scale`/`mouse_delay`, R1 as left click and R2 as right click, and its comment points to this chapter. Uncomment it together with `RUFFLE_SW_CURSOR=1` in the port's cfg or launcher.
+
+Status: documented only. The mapping is known to inject REL events into gptokeyb's virtual device (verified by a test harness on a device earlier), but no run on this PC or a device showed the stick moving a visible cursor end to end.
 
 ### Trade offs
 
@@ -160,7 +170,7 @@ Status: mapping known to inject REL events into gptokeyb's virtual device (verif
 | 4 AS2 overlay | Yes (P-code) | AS2 movies only | Yes | Small P-code patch per SWF | Per SWF patching and depth conflicts |
 | 5 gptokeyb pointer | No | Yes | n/a (input only) | A gptk edit | Useless alone, drift without correct deadzones |
 
-Recommendation until tested: pick 1 plus 5 for a generic port, 3 or 4 when you already patch the shell and want no Ruffle patch. Keep 2 only as a convenience for PC runs.
+Recommendation: pick 1 plus 5 for a generic port (the only one verified for every movie, AS2 and AS3 alike), 3 or 4 when you already patch the shell and want no Ruffle patch. Keep 2 only as a convenience for PC runs.
 
 ## SDL 2.0.10 compatibility
 

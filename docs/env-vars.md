@@ -97,17 +97,17 @@ These exist only in a tree prepared by `tests/sdl_test_hooks.py` (which adds `sd
 
 Variables of the harness scripts themselves (not read by the player): `RES` (default `640x480`), `SHOT_AT` (default `2s`), `EXIT_AFTER_SHOTS` (default `0`), `KEYS`, `MEM_MAX`, `DNUM` (first display number to try, default 90), `RUST_LOG` (default `warn,ruffle_sdl=info,avm_trace=info`), `VIEW`, `VNC_PORT` (default 5990) and `HOLD`. See [10 Testing](10-testing.md).
 
-### Planned software cursor (optional patch 0100)
+### Software cursor (optional patch 0100)
 
-Not in the default series. These variables exist only when `ruffle/optional/0100-ruffle_sdl-software-cursor-overlay.patch` is applied (for example `WITH_OPTIONAL="0100" ruffle/fetch.sh`). Their names and defaults come from the toolkit's design, and the patch text is the authority once it exists. See `09-input.md` for all cursor options.
+Not in the default series. These variables exist only when `ruffle/optional/0100-ruffle_sdl-software-cursor-overlay.patch` is applied (for example `WITH_OPTIONAL="0100" ruffle/fetch.sh`). The patch text is the authority. See `09-input.md` for all cursor options and `ruffle/optional/README.md` for the patch.
 
 | Name | Default | Effect | When to change | Patch or source | Owner |
 |-|-|-|-|-|-|
-| `RUFFLE_SW_CURSOR` | `0` | `1` draws a software cursor as a GL quad after Ruffle's frame. Shown after mouse motion, hidden after idle. Also `--sw-cursor` on the command line. | Games or menus that need a pointer. | optional patch 0100 | C |
+| `RUFFLE_SW_CURSOR` | `0` | `1` (also `true`, `yes`, `on`) draws a software cursor as a GL quad after Ruffle's frame. Shown after mouse motion, hidden after idle. Also `--sw-cursor` on the command line. | Games or menus that need a pointer. | optional patch 0100 | C |
 | `RUFFLE_SW_CURSOR_IDLE_MS` | `2000` | Hide the cursor after this many ms without motion. | Shorter for less distraction. | optional patch 0100 | C |
-| `RUFFLE_SW_CURSOR_SIZE` | `24` | Cursor size in pixels. | Bigger on high resolution screens. | optional patch 0100 | C |
-| `RUFFLE_SW_CURSOR_IMAGE` | unset (built in arrow) | Path to a PNG used as the cursor image. | Custom look. | optional patch 0100 | C |
-| `RUFFLE_SDL_CURSOR` | `0` | `1` uses `SDL_CreateColorCursor` as a fallback (works only where the video driver draws cursors). | Drivers that show an SDL cursor. | optional patch 0100 | C |
+| `RUFFLE_SW_CURSOR_SIZE` | `24` | Height of the built in arrow in pixels (8 to 256). For a PNG image: unset keeps the image size, set scales it to this height. | Bigger on high resolution screens. | optional patch 0100 | C |
+| `RUFFLE_SW_CURSOR_IMAGE` | unset (built in arrow) | Path to a PNG used as the cursor image (up to 512 by 512, hotspot at the top left pixel). A file that fails to load falls back to the arrow with a warning. | Custom look. | optional patch 0100 | C |
+| `RUFFLE_SDL_CURSOR` | `0` | `1` builds an SDL colour cursor (`SDL_CreateColorCursor`) from the same bitmap and shows it. Works only where the video driver draws cursors (X11, Wayland), not on fbdev or KMSDRM without a hardware cursor. | Drivers that show an SDL cursor. | optional patch 0100 | C |
 
 ### Experiments that are not shipped
 

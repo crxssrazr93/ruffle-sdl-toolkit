@@ -169,7 +169,24 @@ black only outside it.
 
 ## Software cursor snippets
 
-The shell side cursor overlays (AS3 and AS2 variants) are provided by a separate step in
-`snippets/cursor_overlay.as3.txt` and `snippets/cursor_overlay.as2.txt`. The other
-implementations (front end overlay, SDL cursor, pointer emulation) are described in
-docs/09-input.md.
+ruffle_sdl hides the system cursor, so a gamepad driven mouse is invisible. Two snippets draw an
+arrow from inside the shell, with no front end patch: `snippets/cursor_overlay.as3.txt` (a Sprite
+added topmost on the stage, shown on `MOUSE_MOVE`, hidden after an idle timer, `mouseEnabled` false)
+and `snippets/cursor_overlay.as2.txt` (a movie clip at a very high depth, `Mouse.addListener`,
+hidden after an idle time). Both are generic. The status of each (tested or not) is the second line
+of its header and is repeated here: both were compiled with ffdec into small test movies and
+verified headless with `tests/cursor_test.sh` (arrow under the pointer after motion, gone after the
+idle time, pixel comparison). Neither was tried on a real game shell or on a device.
+
+Adding them: AS3, put the members into the shell's document class and call `installCursorOverlay()`
+once the stage exists, using `anchor.py` for the insertion and `ffdec.sh replace-as3` to recompile
+that one class. AS2, paste the script into the first frame of the root timeline as source
+(`ffdec.sh raw -replace in.swf out.swf /frame_1/DoAction overlay.as`, ffdec compiles small AS1/2
+sources) or as P-code with `replace-pcode` (see pitfall 7 and 8 above).
+
+One Ruffle detail at this pin matters for both: inside a mouse move handler `_xmouse` (AS2) and
+`stage.mouseX` (AS3) still hold the position of the previous event, so the arrow would lag one
+event behind. The snippets read `e.stageX` (AS3) and follow the pointer every frame (AS2) instead.
+
+The other implementations (front end overlay, SDL colour cursor, pointer emulation) are described
+in docs/09-input.md.
