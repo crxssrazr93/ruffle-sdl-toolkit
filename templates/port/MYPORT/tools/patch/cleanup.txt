@@ -1,0 +1,5 @@
+# Optional. Globs (relative to gamedata/) of files the port does not use, deleted at the end of a
+# successful setup. Keep it narrow: only things the game never loads.
+# Absolute paths and ".." are refused.
+#   META-INF
+#   *.exe

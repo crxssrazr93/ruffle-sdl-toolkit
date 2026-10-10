@@ -1,0 +1,39 @@
+{
+  "version": 4,
+  "name": "MYPORT.zip",
+  "items": [
+    "MYGAME.sh",
+    "MYPORT"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "MYGAME",
+    "porter": [
+      "YOUR NAME"
+    ],
+    "desc": "Describe the GAME here, as a store page would (not the port). One or two sentences. Runs in the Ruffle Flash emulator; you need the game files from MYSTORE.",
+    "desc_md": null,
+    "inst": "Buy the game on MYSTORE and copy everything from its install folder into ports/MYPORT/gamedata/. The first launch patches the game files, which takes a few minutes.",
+    "inst_md": "Buy the game on [MYSTORE](https://example.com/store/page) and copy everything from its install folder into `ports/MYPORT/gamedata/`. The first launch patches the game files, which takes a few minutes.",
+    "genres": [
+      "platformer"
+    ],
+    "image": null,
+    "rtr": false,
+    "exp": false,
+    "runtime": [],
+    "store": [
+      {
+        "name": "MYSTORE",
+        "gameurl": "https://example.com/store/page",
+        "developerurl": "https://example.com/developer"
+      }
+    ],
+    "availability": "paid",
+    "reqs": [],
+    "arch": [
+      "aarch64"
+    ],
+    "min_glibc": "2.30"
+  }
+}

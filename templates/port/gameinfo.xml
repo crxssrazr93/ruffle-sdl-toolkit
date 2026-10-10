@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+  <game>
+    <path>./MYGAME.sh</path>
+    <name>MYGAME</name>
+    <desc>Same text as "desc" in port.json: describe the game, not the port.</desc>
+    <releasedate>20240101T000000</releasedate>
+    <developer>MYDEVELOPER</developer>
+    <publisher>MYPUBLISHER</publisher>
+    <genre>Platformer</genre>
+    <image>./MYPORT/cover.png</image>
+  </game>
+</gameList>

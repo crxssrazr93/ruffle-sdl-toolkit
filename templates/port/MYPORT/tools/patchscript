@@ -1,0 +1,172 @@
+#!/bin/bash
+# First run setup for the MYGAME port, run by PortMaster's patcher screen (utils/patcher.txt).
+# Generic and data driven: nothing game specific lives in this file. Edit the tables in
+# tools/patch/ instead:
+#   version        one line, the patch version. Bump it on every change of any patch or table
+#                  (pushed versions are immutable). The launcher re-runs the setup when it changes.
+#   manifest.txt   md5 of every ORIGINAL input, "md5  path" (as md5sum prints it), path relative
+#                  to gamedata/. The setup refuses files it does not list or that differ.
+#   files.txt      "orig|patch|out" per line. orig = original file, patch = xdelta in tools/patch/,
+#                  out = result. out equal to orig patches in place and keeps the original as
+#                  orig.orig. A differing out leaves orig untouched.
+#   atf.txt        optional, "kind|scale|input|outdir": kind atf decodes input.atf to a PNG in
+#                  outdir, kind swf extracts the textures embedded in input.swf into outdir
+#   atlas.txt      optional, "factor|file.xml": scales a texture atlas XML (from file.xml.orig)
+#   cleanup.txt    optional, one glob per line (relative to gamedata/) of useless files to delete
+# Inputs are inflated (CWS and ZWS to plain FWS) before xdelta3 runs, because the deltas are made
+# against the uncompressed SWF (tools/delivery/make_patch.sh does the same when building them).
+# Success is announced by writing the version into gamedata/.port_patched, as the very last step.
+
+GAMEDIR="${GAMEDIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+DATADIR="$GAMEDIR/gamedata"
+PATCHDIR="$GAMEDIR/tools/patch"
+ATFTOOL="${ATFTOOL:-$GAMEDIR/tools/atftool}"
+XDELTA="${XDELTA:-${controlfolder:+$controlfolder/}xdelta3}"
+[ -x "$XDELTA" ] || XDELTA="xdelta3"
+MANIFEST="$PATCHDIR/manifest.txt"
+# folder name shown in the "copy your files" hint
+HINT_DIR="ports/MYPORT/gamedata/"
+
+exec > >(tee "$GAMEDIR/patchlog.txt") 2>&1
+echo "=== MYGAME: preparing game files $(date) ==="
+
+# PortMaster's patcher screen shows our output; these lines make it report a failure
+fail() {
+  echo "ERROR: $*"
+  echo "PATCH_FAIL_MSG:Setup failed: $*"
+  echo "Patching process failed!"
+  exit 1
+}
+
+# progress shown on the patcher screen as "[step/total] ..."
+STEP=0
+TOTAL=0
+step() { STEP=$((STEP + 1)); echo "[$STEP/$TOTAL] $*"; }
+
+# rows <file>: the non comment, non empty lines of a table (nothing when the file is absent)
+rows() { [ -f "$1" ] && grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$1"; return 0; }
+
+# expected_md5 <path>: the manifest's md5 for a path ("" when not listed)
+expected_md5() {
+  local sum rest
+  while read -r sum rest; do
+    rest=${rest#\*}
+    [ "$rest" = "$1" ] && { echo "$sum"; return 0; }
+  done < <(rows "$MANIFEST")
+  return 0
+}
+
+# check_md5 <file> <expected>
+check_md5() {
+  [ -f "$1" ] || fail "missing $1. Copy the whole game folder into $HINT_DIR"
+  local sum
+  sum=$(md5sum "$1" | awk '{print $1}')
+  [ "$sum" = "$2" ] || fail "$1 has an unexpected checksum ($sum). Only the supported release of the game works."
+}
+
+# unpacked <file> <out>: writes a plain (FWS) copy of a SWF, or a plain copy of any other file
+unpacked() {
+  case "$(head -c 3 "$1" 2>/dev/null)" in
+    CWS | ZWS) "$ATFTOOL" inflate "$1" "$2" || return 1 ;;
+    *) cp "$1" "$2" || return 1 ;;
+  esac
+}
+
+cd "$DATADIR" || fail "gamedata folder not found"
+[ -f "$MANIFEST" ] || fail "tools/patch/manifest.txt is missing from the port"
+[ -x "$ATFTOOL" ] || fail "tools/atftool is missing from the port"
+
+# ---- plan: count the steps first so the screen can show [n/total] ----
+while IFS='|' read -r orig patch out; do TOTAL=$((TOTAL + 1)); done < <(rows "$PATCHDIR/files.txt")
+todo_atf=()
+while IFS='|' read -r kind scale input outdir; do
+  case $kind in
+    atf)
+      # a PNG that exists is complete: the converter writes a temporary name and renames it
+      [ -f "$outdir/$(basename "${input%.atf}").png" ] && continue
+      ;;
+    swf)
+      [ -f "$outdir/.done.$(basename "$input")" ] && continue
+      ;;
+    *) fail "atf.txt: unknown kind '$kind'" ;;
+  esac
+  todo_atf+=("$kind|$scale|$input|$outdir")
+done < <(rows "$PATCHDIR/atf.txt")
+TOTAL=$((TOTAL + ${#todo_atf[@]}))
+while IFS='|' read -r factor xml; do TOTAL=$((TOTAL + 1)); done < <(rows "$PATCHDIR/atlas.txt")
+
+# ---- 1: patch files ----
+while IFS='|' read -r orig patch out; do
+  [ -n "$orig" ] && [ -n "$patch" ] && [ -n "$out" ] || fail "files.txt: bad line '$orig|$patch|$out'"
+  [ -f "$PATCHDIR/$patch" ] || fail "the port is missing tools/patch/$patch"
+  sum=$(expected_md5 "$orig")
+  [ -n "$sum" ] || fail "manifest.txt has no md5 for $orig"
+  if [ "$out" = "$orig" ]; then
+    # In place. A file that matches the manifest is a fresh copy of the game: it replaces the kept
+    # original, so a game copied over a patched one is patched again. Otherwise use the kept one.
+    if [ -f "$orig" ] && [ "$(md5sum "$orig" | awk '{print $1}')" = "$sum" ]; then
+      mv -f "$orig" "$orig.orig" || fail "could not keep the original $orig"
+    fi
+    src="$orig.orig"
+    [ -f "$src" ] || src="$orig"  # nothing kept: check_md5 names the real problem
+  else
+    src="$orig"
+  fi
+  check_md5 "$src" "$sum"
+  step "Patching $orig"
+  mkdir -p "$(dirname "$out")"
+  unpacked "$src" "$out.tmp" || fail "could not prepare $src"
+  "$XDELTA" -d -f -s "$out.tmp" "$PATCHDIR/$patch" "$out.new" || fail "xdelta3 failed on $src"
+  rm -f "$out.tmp"
+  mv -f "$out.new" "$out"
+done < <(rows "$PATCHDIR/files.txt")
+
+# ---- 2: atlas XMLs (always scaled from the untouched .orig copy) ----
+# A file that is neither the kept original nor its scaled version is a fresh copy of the game and
+# becomes the new original.
+while IFS='|' read -r factor xml; do
+  [ -f "$xml" ] || [ -f "$xml.orig" ] || fail "missing $xml. Copy the whole game folder into $HINT_DIR"
+  if [ -f "$xml" ] && [ -f "$xml.orig" ] && ! cmp -s "$xml" "$xml.orig"; then
+    "$ATFTOOL" atlasxml "$factor" "$xml.orig" "$xml.tmp" || fail "could not scale $xml"
+    cmp -s "$xml" "$xml.tmp" || rm -f "$xml.orig"
+    rm -f "$xml.tmp"
+  fi
+  if [ ! -f "$xml.orig" ]; then
+    cp "$xml" "$xml.tmp" || fail "could not back up $xml"
+    mv -f "$xml.tmp" "$xml.orig"
+  fi
+  sum=$(expected_md5 "$xml")
+  [ -z "$sum" ] || check_md5 "$xml.orig" "$sum"
+  step "Scaling $xml"
+  "$ATFTOOL" atlasxml "$factor" "$xml.orig" "$xml.tmp" || fail "could not scale $xml"
+  mv -f "$xml.tmp" "$xml"
+done < <(rows "$PATCHDIR/atlas.txt")
+
+# ---- 3: textures ----
+for item in "${todo_atf[@]}"; do
+  IFS='|' read -r kind scale input outdir <<< "$item"
+  [ -f "$input" ] || fail "missing $input. Copy the whole game folder into $HINT_DIR"
+  sum=$(expected_md5 "$input")
+  [ -z "$sum" ] || check_md5 "$input" "$sum"
+  step "Converting textures: $input"
+  mkdir -p "$outdir"
+  "$ATFTOOL" "$kind" "$scale" "$outdir" "$input" > /dev/null || fail "texture conversion failed: $input"
+  if [ "$kind" = atf ]; then
+    [ -f "$outdir/$(basename "${input%.atf}").png" ] || fail "texture conversion did not produce a PNG for $input"
+  else
+    : > "$outdir/.done.$(basename "$input")"
+  fi
+done
+
+# ---- 4: remove files the port does not use (captive runtimes, Windows binaries) ----
+while read -r glob; do
+  case $glob in /* | *..*) fail "cleanup.txt: unsafe path '$glob'" ;; esac
+  # the glob is meant to expand
+  # shellcheck disable=SC2086
+  rm -rf $glob 2>/dev/null
+done < <(rows "$PATCHDIR/cleanup.txt")
+
+# the very last step: only a finished setup leaves the version behind
+cat "$PATCHDIR/version" > .port_patched
+echo "=== Done. Enjoy! ==="
+exit 0

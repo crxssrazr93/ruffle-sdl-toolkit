@@ -1,0 +1,3 @@
+# Optional. One line per texture atlas XML to scale: factor|file.xml (relative to gamedata/)
+# The scaled file is always made from file.xml.orig, the untouched copy.
+#   0.5|tex/atlas.xml

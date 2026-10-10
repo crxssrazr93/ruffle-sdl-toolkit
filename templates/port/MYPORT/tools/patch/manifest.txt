@@ -1,0 +1,4 @@
+# md5 of every ORIGINAL input, in the format md5sum prints: "<md5>  <path under gamedata/>".
+# Generate with tools/delivery/make_manifest.sh <game folder> [globs] (sorted with LC_ALL=C).
+# Example (replace with real lines):
+# 00000000000000000000000000000000  MYGAME.swf

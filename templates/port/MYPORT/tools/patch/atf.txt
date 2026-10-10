@@ -1,0 +1,4 @@
+# Optional. One line per texture job: kind|scale|input|outdir (all paths relative to gamedata/)
+#   atf|0.5|tex/hero.atf|tex           decode one ATF file to tex/hero.png at half size
+#   swf|0.5|MYGAME.swf.orig|tex/emb    extract the ATF textures embedded in a SWF, as PNGs
+# Already converted PNGs are skipped (the converter renames a finished file into place).

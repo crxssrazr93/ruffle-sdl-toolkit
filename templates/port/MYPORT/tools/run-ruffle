@@ -1,0 +1,143 @@
+#!/bin/bash
+# run-ruffle <ruffle_sdl> <args...> <file.swf>
+#
+# Runs ruffle_sdl and restarts it when the game asks for that. The shell calls
+# fscommand("relaunch", "<args>"); ruffle_sdl then prints one stdout line
+#     RUFFLE_RELAUNCH <args>
+# and exits. This wrapper starts the binary again with the args after the marker, so a game that
+# is split into several SWFs keeps only one of them in memory (process exit is the only reliable
+# way to give memory back to the system on a 1 GB handheld).
+#
+# Why bash builtins only: this runs on every PortMaster firmware, and the tools the firmwares
+# ship differ (BusyBox or coreutils, no stat on muOS, no mktemp on some). A loop of read, case and
+# printf needs nothing from PATH, so it cannot fail for a missing tool, and it adds no process
+# per output line while ruffle_sdl is running.
+#
+# Environment:
+#   RELAUNCH_MARKER   marker word, default RUFFLE_RELAUNCH
+#   RELAUNCH_MAX      safety limit of restarts per run, default 500
+#   RUN_RUFFLE_ENV    optional table of per level environment, default tools/run-ruffle.env
+#                     one rule per line: glob|VAR=value VAR=value
+#                     the glob is matched against " arg1 arg2 ... " (all arguments joined by
+#                     spaces, a space at both ends), for example: * -Plevel=big *|RUFFLE_FRAMESKIP=1
+#
+# Arguments after the marker are split like a shell does: spaces separate, single or double
+# quotes group, a backslash escapes. A -Pname=value among them replaces the same -Pname given on
+# the first command line (the other first command line flashvars are kept). An argument that ends
+# in .swf replaces the SWF to run (and stays replaced until a later relaunch names another).
+#
+# Exit code: the exit code of the last ruffle_sdl run (127 when the binary is missing).
+
+usage() { echo "usage: run-ruffle <ruffle_sdl> [args...] <file.swf>" >&2; exit 2; }
+
+ruffle=$1
+[ -n "$ruffle" ] && [ $# -ge 2 ] || usage
+shift
+if [ ! -x "$ruffle" ]; then
+  echo "run-ruffle: cannot run $ruffle (missing or not executable)" >&2
+  exit 127
+fi
+
+swf=${!#}
+set -- "${@:1:$#-1}"
+base=("$@")
+next=()
+cur=("${base[@]}")
+marker=${RELAUNCH_MARKER:-RUFFLE_RELAUNCH}
+max=${RELAUNCH_MAX:-500}
+case $0 in */*) here=${0%/*} ;; *) here=. ;; esac
+envfile=${RUN_RUFFLE_ENV:-$here/run-ruffle.env}
+
+# split_args <string>: shell like words into the array "parsed"
+split_args() {
+  parsed=()
+  local s=$1 word="" have=0 q="" c i
+  s=${s%$'\r'}
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    if [ -n "$q" ]; then
+      if [ "$c" = "$q" ]; then q=""; else word+=$c; fi
+    else
+      case $c in
+        '"' | "'") q=$c; have=1 ;;
+        '\') i=$((i + 1)); word+=${s:i:1}; have=1 ;;
+        ' ' | $'\t') if [ $have = 1 ]; then parsed+=("$word"); word=""; have=0; fi ;;
+        *) word+=$c; have=1 ;;
+      esac
+    fi
+  done
+  [ $have = 1 ] && parsed+=("$word")
+  return 0
+}
+
+# run_once <args...>: one ruffle_sdl run, with the environment rules that match the arguments
+run_once() {
+  (
+    if [ -f "$envfile" ]; then
+      joined=" $* "
+      while IFS='|' read -r pat vars || [ -n "$pat" ]; do
+        case $pat in '' | '#'*) continue ;; esac
+        # the glob is meant to be a pattern
+        # shellcheck disable=SC2254
+        case $joined in
+          $pat)
+            set -f
+            for kv in $vars; do
+              # shellcheck disable=SC2163
+              case $kv in *=*) export "$kv" ;; esac
+            done
+            set +f
+            ;;
+        esac
+      done < "$envfile"
+    fi
+    exec "$ruffle" "$@"
+  )
+}
+
+rc=0
+count=0
+while :; do
+  target=""
+  found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line"
+    case $line in
+      "$marker" | "$marker "*) target=${line#"$marker"}; found=1 ;;
+    esac
+  done < <(run_once "${cur[@]}" "${next[@]}" "$swf")
+  # the process substitution is the last background job; wait gives the exit code of ruffle_sdl
+  wait $!
+  rc=$?
+  [ $found = 1 ] || break
+
+  count=$((count + 1))
+  if [ "$count" -gt "$max" ]; then
+    echo "run-ruffle: more than $max relaunches, giving up" >&2
+    exit 1
+  fi
+  split_args "$target"
+  # flashvars named after the marker replace the same names from the first command line
+  next=()
+  for a in "${parsed[@]}"; do
+    case $a in
+      *.swf) swf=$a ;;
+      *) next+=("$a") ;;
+    esac
+  done
+  kept=()
+  for b in "${base[@]}"; do
+    drop=0
+    case $b in
+      -P*=*)
+        for a in "${next[@]}"; do
+          [ "${a%%=*}" = "${b%%=*}" ] && drop=1
+        done
+        ;;
+    esac
+    [ $drop = 1 ] || kept+=("$b")
+  done
+  echo "=== relaunch $count: ${next[*]} $swf ===" >&2
+  cur=("${kept[@]}")
+done
+exit "$rc"

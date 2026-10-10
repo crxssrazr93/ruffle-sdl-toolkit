@@ -1,0 +1,7 @@
+# One line per file to patch: orig|patch|out
+#   orig  original file, relative to gamedata/
+#   patch xdelta file in this folder, made against the INFLATED original (tools/delivery/make_patch.sh)
+#   out   result, relative to gamedata/. Same as orig = patch in place (the original is kept as
+#         orig.orig). Different = write a new file and leave orig untouched.
+# Example (replace with real lines):
+# MYGAME.swf|MYGAME.xdelta|MYGAME-port.swf

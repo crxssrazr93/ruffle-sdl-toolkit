@@ -1,0 +1,53 @@
+# gptokeyb map for a keyboard driven Flash game. Flash reads the keyboard, never the gamepad, so
+# every button the game needs is turned into a key here. Buttons are named by their position as
+# SDL lays them out: "a" is the bottom face button, "b" the right, "x" the left, "y" the top.
+# On some devices (Anbernic style layouts) the labels printed on the console differ from these
+# positions; tell the players in the README, and on Knulli they can swap A/B per game.
+#
+# EDIT the keys on the right to the keys the game really reads. Check the game's own code first:
+# a key that looks harmless can pause, quit or lock up a screen.
+
+# Quit is Select + Start, which gptokeyb handles itself. Leave back and guide empty so they do not
+# send a stray key.
+back = \"
+guide = \"
+start = space
+
+# Face buttons: the game's jump, attack, action and extra keys (examples)
+a = s
+b = a
+x = d
+y = shift
+
+# L1 and L2 as volume keys (examples: m and n, if the shell patch listens to them)
+l1 = m
+l2 = n
+
+# D pad and left stick as arrow keys
+up = up
+down = down
+left = left
+right = right
+
+left_analog_up = up
+left_analog_down = down
+left_analog_left = left
+left_analog_right = right
+
+# Right stick as a mouse pointer, and R1 and R2 as clicks, for games with mouse only menus.
+# The pointer is invisible on most firmwares: it needs a software cursor (see the toolkit's
+# docs/09-input.md) or the game must draw its own. Remove the # on the lines below to use it.
+#right_analog_up = mouse_movement_up
+#right_analog_down = mouse_movement_down
+#right_analog_left = mouse_movement_left
+#right_analog_right = mouse_movement_right
+#mouse_scale = 1024
+#mouse_delay = 6
+#r1 = mouse_left
+#r2 = mouse_right
+
+# Analog stick dead zone, tuned so the stick does not drift at rest
+deadzone_mode = scaled_radial
+deadzone = 4096
+deadzone_scale = 8
+deadzone_delay = 16
