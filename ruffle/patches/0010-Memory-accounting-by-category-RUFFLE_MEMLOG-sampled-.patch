@@ -4,7 +4,7 @@ Date: Wed, 7 Oct 2026 09:14:53 -0400
 Subject: [PATCH 10/14] Memory accounting by category (RUFFLE_MEMLOG), sampled
  by ruffle_sdl
 
-The tool that found where World 2 of Fancy Pants Adventures spent its 800
+The tool that found where a large AVM1 game spent its 800
 MB, kept so the next memory problem on a handheld can be measured the same
 way. Off by default: a disabled tag is an inert value and costs one branch.
 
@@ -249,7 +249,7 @@ index bc30f92e..3157cbd7 100644
 +++ b/core/src/display_object/graphic.rs
 @@ -64,6 +64,9 @@ impl<'gc> Graphic<'gc> {
          // bytes when the shape is first rendered or hit-tested. They held about 95 MB for World 2
-         // of Fancy Pants Adventures, most of it shapes of levels that are not being played.
+         // of the game, most of it shapes of levels that are not being played.
          let lazy_records = lazy_shapes() && lazy_shape_records() && tag.is_some();
 +        if !lazy_records {
 +            account_records(&swf_shape, "preload");

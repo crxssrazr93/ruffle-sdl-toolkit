@@ -5,7 +5,7 @@ Subject: [PATCH 06/14] ruffle_sdl: Ruffle on SDL2 and GLES 3 for handhelds
 
 A small front end (new crate sdl/, binary ruffle_sdl) for Linux handhelds
 that have SDL2 and a GLES driver but no X11 or Wayland session. It replaces
-Westonpack plus desktop Ruffle for the Fancy Pants Adventures port.
+Westonpack plus desktop Ruffle for handheld ports.
 
 * Video: SDL opens a fullscreen window with a GLES 3.0 context. wgpu runs on
   that context through wgpu-hal external GLES adapter (no wgpu backend of its
@@ -23,7 +23,7 @@ Westonpack plus desktop Ruffle for the Fancy Pants Adventures port.
   folder, with its executor polled in the main loop (so the Classic Pack shell
   can load its worlds, with no reqwest, tokio or OpenSSL in the binary).
 * fscommand: "quit" ends the loop; "relaunch <args>" prints
-  "FPA_RELAUNCH <args>" and quits, so the port launch script can start Ruffle
+  "RUFFLE_RELAUNCH <args>" and quits, so the port launch script can start Ruffle
   again straight into the next world (one world in memory at a time).
 * Stage: --stage-scale fit (default) centres and scales the stage to fit
   whatever the movie asks for; --stage-scale movie keeps the movie own scale
@@ -755,11 +755,11 @@ index 00000000..5ac9cc38
 +                self.quit.set(true);
 +                true
 +            }
-+            // Fancy Pants Adventures port: ask the launch script to start Ruffle again with `args`
++            // Ask the launch script to start Ruffle again with `args`
 +            // (it reads this line from stdout), so each world runs in a fresh process
 +            "relaunch" => {
 +                use std::io::Write;
-+                println!("FPA_RELAUNCH {args}");
++                println!("RUFFLE_RELAUNCH {args}");
 +                let _ = std::io::stdout().flush();
 +                self.quit.set(true);
 +                true

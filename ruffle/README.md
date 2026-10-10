@@ -10,7 +10,7 @@ Ruffle itself is MIT OR Apache-2.0. The patches stay under that license with eac
 |-|-|
 | `PIN` | Full 40 character upstream commit the series applies to |
 | `series` | Patch file names in apply order (`#` comments allowed) |
-| `patches/` | The default series, 0001 to 0014 |
+| `patches/` | The default series, 0001 to 0013 |
 | `optional/` | Patches that are not in the default series (for example 0100, the software cursor overlay) |
 | `fetch.sh [dir]` | Clone the pin and `git am` the series. `RUFFLE_REPO` overrides the clone source, `WITH_OPTIONAL="0100"` adds optional patches |
 | `build-aarch64.sh <src> <out>` | Docker cross build, glibc 2.30 floor (ubuntu:20.04). Prints the max GLIBC version and NEEDED libraries |
@@ -32,18 +32,18 @@ ruffle/build-x86_64.sh work/ruffle-src work/out-pc
 
 ## The patches
 
-Credit: patches 0001 to 0004, 0013 and 0014 are by crxssrazr93. The `ruffle_sdl` front end (0006) and the memory patches 0005 and 0007 to 0012 are by Knifethrower (contributed as GitHub PR #1 on the example port repo), and carry the author line `port <port@localhost>` from the original export. Do not rewrite those author lines.
+Credit: patches 0001 to 0004 and 0013 are by crxssrazr93. The `ruffle_sdl` front end (0006) and the memory patches 0005 and 0007 to 0012 are by Knifethrower (contributed as GitHub PR #1 on the example port repo), and carry the author line `port <port@localhost>` from the original export. Do not rewrite those author lines.
 
 Env vars are read at run time. "Generic" means the patch has no game specific behaviour.
 
 | # | Title | Author | Env vars (default) | Generic |
 |-|-|-|-|-|
 | 0001 | avm2: implement Graphics.readGraphicsData | crxssrazr93 | none | Yes, upstreamable |
-| 0002 | Stage3D batching, pipeline and bind group caches, TextureBase.dispose, relaunch fscommand, FPS log | crxssrazr93 | RUFFLE_FPS_LOG (off, any value turns it on, needs RUST_LOG including ruffle_core::player::port_fps=info) | Yes. Its relaunch marker is renamed by 0014 |
+| 0002 | Stage3D batching, pipeline and bind group caches, TextureBase.dispose, relaunch fscommand, FPS log | crxssrazr93 | RUFFLE_FPS_LOG (off, any value turns it on, needs RUST_LOG including ruffle_core::player::port_fps=info) | Yes. The relaunch marker is the generic RUFFLE_RELAUNCH |
 | 0003 | Keep Stage3D texture uploads on the GPU, texture dispose, AS3 profiler | crxssrazr93 | RUFFLE_AS3_PROF (off, any value turns it on) | Yes |
 | 0004 | Lazy mouse picking and frame skipping for frame based AVM1 games | crxssrazr93 | RUFFLE_LAZY_MOUSE_PICK (off), RUFFLE_FRAMESKIP (off) | Yes, opt in |
 | 0005 | core: Player::add_gc_work and Player::collect_garbage_now | Knifethrower | none | Yes, upstreamable |
-| 0006 | ruffle_sdl: Ruffle on SDL2 and GLES 3 for handhelds | Knifethrower | RUFFLE_GC_STEP (0.01), RUFFLE_TRIM_SECS (2), RUFFLE_GC_LONG_TICK (1.0), RUFFLE_SDL_TIMING (off), RUST_LOG (warn), WGPU_* options | Yes. Its relaunch marker is renamed by 0014 |
+| 0006 | ruffle_sdl: Ruffle on SDL2 and GLES 3 for handhelds | Knifethrower | RUFFLE_GC_STEP (0.01), RUFFLE_TRIM_SECS (2), RUFFLE_GC_LONG_TICK (1.0), RUFFLE_SDL_TIMING (off), RUST_LOG (warn), WGPU_* options | Yes. The relaunch marker is the generic RUFFLE_RELAUNCH |
 | 0007 | core: tessellate DefineShapes on first render, parse shape records on demand | Knifethrower | RUFFLE_LAZY_SHAPES (on), RUFFLE_LAZY_SHAPE_RECORDS (on) | Yes, upstream candidate |
 | 0008 | wgpu: draw BitmapData.draw in place when it can, cap the offscreen pool | Knifethrower | RUFFLE_DRAW_IN_PLACE (on), RUFFLE_DRAW_POOL_MB (16, 0 off) | Yes |
 | 0009 | core: blank BitmapData without resident pixels or zero uploads | Knifethrower | RUFFLE_ZEROED_PIXELS (on), RUFFLE_EMPTY_TEXTURES (on) | Yes |
@@ -51,9 +51,8 @@ Env vars are read at run time. "Generic" means the patch has no game specific be
 | 0011 | Stage3D uploads without a submit, consecutive draws in one render pass | Knifethrower | RUFFLE_S3D_DEFER_UPLOAD (on), RUFFLE_S3D_MERGE_PASSES (on), PM_GPUSTAT (off) | Yes. PM_GPUSTAT has a port prefix in its name |
 | 0012 | ruffle_sdl: run with SDL 2.0.10 | Knifethrower | none | Yes |
 | 0013 | ruffle_sdl: minimum key hold, so games that poll keys see short taps | crxssrazr93 | RUFFLE_MIN_KEY_HOLD_MS (100, 0 off) | Yes |
-| 0014 | ruffle_sdl, desktop: generic RUFFLE_RELAUNCH marker, drop PORT_EXP experiment | crxssrazr93 | none | Yes |
 
-Notes on 0014: the relaunch fscommand now prints `RUFFLE_RELAUNCH <args>` on stdout (in `ruffle_sdl` and in the desktop player) and exits, so a launch script can restart the binary with new arguments. The temporary PORT_EXP draw skipping experiment that the older inventory listed is already removed by patch 0003, so there was nothing left to delete.
+Note: in 0002 and 0006 the relaunch fscommand prints `RUFFLE_RELAUNCH <args>` on stdout and exits, so a launch script can restart the binary with new arguments. These two patches were lightly edited after export (marker name and prose only, no author lines changed) so that the series carries no game specific names. The temporary PORT_EXP experiment from the early Stage3D work is removed within the series (0003), so nothing needs deleting.
 
 The full table of env vars, with when to change each, is in `docs/env-vars.md`.
 

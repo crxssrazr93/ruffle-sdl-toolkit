@@ -7,7 +7,7 @@ Subject: [PATCH 07/14] core: tessellate DefineShapes on first render, parse
 Ruffle registered (tessellated) every DefineShape of a SWF while preloading
 it, and uploaded the bitmaps of the shapes bitmap fills at the same time. It
 also kept the parsed records of every shape for the life of the movie. For
-Fancy Pants Adventures World 2 (one SWF with every level) that was 4,255
+One large AVM1 game (one SWF with every level) that was 4,255
 meshes (131 MB of vertex and index buffers), 44 bitmap fill textures (226 MB)
 and about 95 MB of shape records, most of it for levels that are not being
 played. The game was OOM-killed on 1 GB handhelds.
@@ -68,7 +68,7 @@ index b566e996..bc30f92e 100644
 +        // PortMaster port (`RUFFLE_LAZY_SHAPE_RECORDS`, default on, "0" turns it off): with lazy
 +        // shapes the parsed records are dropped after preload and parsed again from the tag's
 +        // bytes when the shape is first rendered or hit-tested. They held about 95 MB for World 2
-+        // of Fancy Pants Adventures, most of it shapes of levels that are not being played.
++        // of the game, most of it shapes of levels that are not being played.
 +        let lazy_records = lazy_shapes() && lazy_shape_records() && tag.is_some();
 +        let render_handle = if lazy_shapes() {
 +            None

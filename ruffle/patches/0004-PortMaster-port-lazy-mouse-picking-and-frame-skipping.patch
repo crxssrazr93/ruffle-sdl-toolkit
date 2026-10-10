@@ -6,7 +6,7 @@ Subject: [PATCH 04/14] PortMaster port: lazy mouse picking and frame skipping
 
 RUFFLE_LAZY_MOUSE_PICK: only pick the object under the mouse again when the
 mouse moves or a button changes. Re-picking every frame walked every clip of
-Fancy Pants World 3's levels and took about a third of the frame time on a
+a large AVM1 game's levels and took about a third of the frame time on a
 Cortex-A53.
 
 RUFFLE_FRAMESKIP: allow a second frame per tick when frames run slow, so
@@ -26,7 +26,7 @@ index 6fd49924..e64d57ed 100644
 -            ((frame_time / average_run_frame_time) as u32).clamp(1, MAX_FRAMES_PER_TICK)
 +            let frames =
 +                ((frame_time / average_run_frame_time) as u32).clamp(1, MAX_FRAMES_PER_TICK);
-+            // PortMaster port: frame-based games (Fancy Pants World 3) slow down whenever a
++            // PortMaster port: frame-based games (large AVM1 games) slow down whenever a
 +            // frame takes longer than the frame time. With RUFFLE_FRAMESKIP set, allow a
 +            // second frame per tick so game speed holds and only the picture skips frames.
 +            if port_frameskip() {
@@ -49,7 +49,7 @@ index 6fd49924..e64d57ed 100644
 +            } else if port_lazy_mouse_pick() && !is_mouse_moved && changed_mouse_buttons.is_empty()
 +            {
 +                // PortMaster port: re-picking every frame walks every clip of a large AVM1
-+                // level (a third of the frame time in Fancy Pants World 3 on a Cortex-A53).
++                // level (a third of the frame time in a large AVM1 game on a Cortex-A53).
 +                // With RUFFLE_LAZY_MOUSE_PICK set, only pick again when the mouse moves or
 +                // clicks.
 +                context.mouse_data.hovered

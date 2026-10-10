@@ -189,7 +189,7 @@ index 7f9fc62f..9eba866b 100644
 +            // this line from stdout), so that each game starts in a fresh process.
 +            "relaunch" => {
 +                use std::io::Write;
-+                println!("FPA_RELAUNCH {args}");
++                println!("RUFFLE_RELAUNCH {args}");
 +                let _ = std::io::stdout().flush();
 +                let _ = self.event_loop.send_event(RuffleEvent::ExitRequested);
 +            }

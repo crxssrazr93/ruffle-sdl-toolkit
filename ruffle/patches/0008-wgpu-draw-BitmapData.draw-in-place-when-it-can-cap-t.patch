@@ -8,7 +8,7 @@ render_offscreen copies the target texture into a pooled frame buffer of the
 same size, draws there and copies the result back. The pool keeps one frame
 buffer per size until the end of the frame, and the command encoder keeps
 them alive until it is submitted. Games that build a level cache out of
-dozens of large BitmapData in one tick (Fancy Pants Adventures World 3 Level
+dozens of large BitmapData in one tick (one game's Level
 4: 65 tiles, 76 MB of pooled frame buffers) briefly doubled the cache memory
 on the GPU.
 
@@ -172,7 +172,7 @@ index 80cc84d7..147f70e4 100644
 +        // PortMaster port (`RUFFLE_DRAW_POOL_MB`, default 16, 0 = off): the pool keeps a frame
 +        // buffer of every size drawn into until the end of the frame, and the encoder keeps them
 +        // all alive until it is submitted. A level cache of 65 bitmaps built in one tick (World 3
-+        // of Fancy Pants Adventures) held 76 MB of them. Once the draws since the last trim add up
++        // of one game) held 76 MB of them. Once the draws since the last trim add up
 +        // to this much, the work is submitted and the pool emptied, so their memory is freed.
 +        let limit = draw_pool_limit();
 +        if limit > 0 {
