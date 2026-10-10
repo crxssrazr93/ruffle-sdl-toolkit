@@ -110,7 +110,7 @@ mouse_scale = 1024
 mouse_delay = 6
 ```
 
-R1 and R2 as left clicks let mouse only menus work, but only if a cursor is visible. A mouse mapping with no cursor is confusing and useless. Verify the stick to mouse mapping with `evtest` per device: on one device the right stick axes (ABS_Z, ABS_RZ) produced key events and REL events in an unexpected order.
+The template `templates/port/MYPORT/MYPORT.gptk` has these lines commented out, keeps the dead zone settings active, and maps R1 to a left click and R2 to a right click. R1 and R2 as clicks let mouse only menus work, but only if a cursor is visible. A mouse mapping with no cursor is confusing and useless. Verify the stick to mouse mapping with `evtest` per device: on one device the right stick axes (ABS_Z, ABS_RZ) produced key events and REL events in an unexpected order.
 
 ## Software cursor: every implementation
 
