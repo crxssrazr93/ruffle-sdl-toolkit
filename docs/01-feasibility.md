@@ -55,6 +55,8 @@ Use `tools/swf/swf_info.py` to read the compression, version, frame rate, stage 
 python3 tools/swf/swf_info.py MYGAME/*.swf
 ```
 
+It prints, per file, the version, compression (none, zlib CWS or LZMA ZWS), uncompressed length, stage size, frame rate, frame count, `AVM2` when DoABC tags exist or `AVM1 only` when only DoAction tags do, and the number of DefineBinaryData tags and how many of them start with the ATF signature. The script type is a heuristic: only the top level tags are read, so code that lives only inside sprite frames is not seen. Confirm the answer with the decompiler before you plan around it. Exit codes: 0 ok, 1 usage, 2 unreadable, 3 not a SWF.
+
 The SWF frame rate matters for reasoning about game clocks. On an inflated SWF (first byte `F`), the rate is stored right after the stage rectangle. If you need it by hand: `nbits = d[8] >> 3; rb = (5 + 4*nbits + 7) // 8; fps = d[8+rb+1] + d[8+rb]/256`.
 
 ## 3. The AIR runtime flag

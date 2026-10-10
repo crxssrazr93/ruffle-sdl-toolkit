@@ -14,10 +14,11 @@ Measure before you blame the content. In the case that drove this work, the game
 
 **What it does.** When the shell is about to switch to a different sub game or world, it saves its state and calls `fscommand("relaunch", "<args>")`. `ruffle_sdl` prints one stdout line, `RUFFLE_RELAUNCH <args>`, flushes shared objects and exits. The wrapper script `run-ruffle` (written with bash builtins only) notices the marker line and starts `ruffle_sdl` again with new flashvars (`-Pgame=... -Plevel=... -Pdoor=...`). The shell's `preLoadGame` is made a no-op so the new process goes straight to the requested content. One world lives in memory per process, and each world gets the whole 1 GB.
 
-**Wrapper behaviour.**
-* It runs the binary with stdout and stderr piped, echoes every line to stderr (so the line also reaches `log.txt`), and captures the first line starting with the marker.
-* The marker prefix is `RUFFLE_RELAUNCH`. Override it with the `RELAUNCH_MARKER` variable in the wrapper if you must.
-* Use bash builtins only (`read`, `[[ ]]`, parameter expansion). A library preloaded into every process can print its own banner, and `sed` or `tail` in the pipe then re-reads that banner as a target and loops.
+**Wrapper behaviour** (`templates/port/MYPORT/tools/run-ruffle`, see [11](11-launcher-packaging.md)).
+* It runs the binary and copies every stdout line to its own stdout (so the line also reaches `log.txt`). When a line starts with the marker, the words after it become the next arguments, and the binary is started again once the old one has exited.
+* The marker prefix is `RUFFLE_RELAUNCH`. Override it with the `RELAUNCH_MARKER` environment variable if you changed the patch. `RELAUNCH_MAX` (default 500) limits the restarts of one run.
+* It uses bash builtins only (`read`, `case`, parameter expansion). A library preloaded into every process can print its own banner, and `sed` or `tail` in the pipe then re-reads that banner as a target and loops.
+* `-Pname=value` words in the marker line replace the same flashvar from the first command line, and a `.swf` word replaces the SWF to run.
 * State crosses the boundary only through `SharedObject` saves and the boot flashvars.
 * Expect a short black screen at each world change. Tell players that is Ruffle restarting to free memory.
 

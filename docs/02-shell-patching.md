@@ -16,19 +16,22 @@ Read this when you have decided the port is feasible (doc 01) and now have to ma
 JPEXS Free Flash Decompiler (ffdec) 26.3.0 was the version used. It needs a JRE (OpenJDK 21 worked). Get it from the jindrapetrik/jpexs-decompiler releases (`ffdec_26.3.0.zip`), and point the toolkit at it:
 
 ```
-export FFDEC=/path/to/ffdec/ffdec        # wrapper script, or run: java -jar ffdec.jar
+export FFDEC=/path/to/ffdec/ffdec        # launcher script or ffdec.jar (FFDEC_JAR and a PATH lookup also work)
 tools/swf/ffdec.sh as3    shell.swf work/shell_src                 # all AS3 scripts
 tools/swf/ffdec.sh as3    shell.swf work/shell_src MainClass       # one class
 tools/swf/ffdec.sh pcode  world.swf work/world_pcode              # AS2 P-code
 tools/swf/ffdec.sh replace-as3   shell.swf out.swf MainClass work/shell_src/scripts/MainClass.as
 tools/swf/ffdec.sh replace-pcode world.swf out.swf /frame_1/DoAction work/world_pcode/scripts/frame_1/DoAction.pcode
+tools/swf/ffdec.sh raw -help                                        # any other ffdec option, passed straight through
 ```
+
+The wrapper locates ffdec through `FFDEC`, then `FFDEC_JAR`, then `ffdec` on `PATH`, runs Java headless (`JAVA` picks a JVM, `FFDEC_OPTS` adds pre options such as `-air`) and exits 2 when ffdec or java is missing, 3 when an export produced nothing. A class list takes several names (`as3 shell.swf dir ClassA ClassB`) or a package wildcard (`'com.example.+'`). `replace-as3` and `replace-pcode` take any number of `<name> <file>` pairs in one call.
 
 Under the hood these are ffdec commands:
 
 - Export scripts: `-export script <dir> <swf>`. One class: `-selectclass <Class> -export script <dir> <swf>`.
 - P-code instead of source: `-format script:pcode -export script <dir> <swf>`.
-- Binary tags (embedded ATF and others): `-export binaryData <dir> <swf>`.
+- Binary tags (embedded ATF and others): `-export binaryData <dir> <swf>`, through `ffdec.sh raw`.
 - Replace: `-replace <in.swf> <out.swf> <ClassOrScriptName> <file> [<name2> <file2> ...]`. Several in one call. ffdec prints `Warning: This feature is EXPERIMENTAL`. That is normal.
 - `-air` as a pre option compiles against airglobal.swc instead of playerglobal.swc. The port took the strip route instead of using it, because Ruffle only stubs AIR anyway.
 
@@ -54,16 +57,19 @@ p = Patch.load("work/shell_src/scripts/Main.as")
 p.sub('NativeApplication.nativeApplication.exit();', 'fscommand("quit");', count=2)
 p.sub('var w:int = nativeWindow.width;', 'var w:int = stage.stageWidth;')   # count defaults to 1
 p.drop_method("onGameInputDeviceAdded")        # removes the method by brace matching
+p.sub_regex(r"var\s+steam\s*:\s*\w+;", "")      # a regex anchor, also with an expected count
+p.insert_after("super();\n", "         boot();\n")   # or insert_before(anchor, text)
 p.forbid(["Steamworks", "nativeWindow", "NativeApplication", "GameInput", "File."])
 p.save("work/shell_patched/Main.as")
-p.report()                                     # prints the patched OK summary
+p.summary()                                    # per step counts, then "patched OK" 
 ```
 
 What these do:
 
 - `sub(old, new, count=1)` counts the matches first and exits with `patch anchor matched Nx (expected M)` if the count differs. On a first run this caught a real miscount: `patch anchor matched 2x (expected 3): 'NativeApplication.nativeApplication.exit();'`.
 - `drop_method(name)` deletes a whole method with brace matching. Use it for controller setup, window moving, close handlers and Steam response handlers.
-- `forbid(list)` scans for leftover identifiers at the end. If any remain it fails and lists them. This is the guard that keeps AIR code from slipping through.
+- `forbid(list)` scans for leftover identifiers at the end. If any remain it fails with `leftover forbidden references:` and the line numbers. This is the guard that keeps AIR code from slipping through. A plain identifier is matched as a whole word that is not preceded by a dot, so a fully qualified use such as `flash.desktop.NativeApplication` is not caught by the name `NativeApplication` alone. List such text (for example `"flash.desktop"`, which contains a dot and is matched as plain text) as its own entry.
+- `Patch(text, raise_errors=True)` raises `PatchError` instead of exiting, which is useful in tests. `python3 tools/swf/anchor.py --selftest` runs the library's own check.
 
 `tools/swf/example_patch.py` is a documented template that uses the library. Copy it and replace the anchors.
 
@@ -236,7 +242,7 @@ A debug variant of a patched class can print state from the Ruffle log, for exam
 Goal: take an AIR shell `Shell.swf` (AS3) and an AS2 world `World1.swf`, and produce `Shell-port.swf` and `World1.swf` patched.
 
 ```python
-# patch_shell.py  (run by tools/swf/ffdec.sh helpers, anchors are examples)
+# patch_shell.py (anchors are examples, copy tools/swf/example_patch.py for a fuller template)
 import sys
 sys.path.insert(0, "tools/swf")
 from anchor import Patch
@@ -270,7 +276,7 @@ p.sub("function LoadGame(g:String, l:int) {",
 
 p.forbid(["Steamworks", "nativeWindow", "NativeApplication", "GameInput", "File."])
 p.save(dst + "/Main.as")
-p.report()
+p.summary()
 ```
 
 Build and test:

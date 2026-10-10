@@ -17,7 +17,7 @@ python3 tools/swf/swf_inflate.py original.swf original.fws.swf
 python3 tools/swf/swf_inflate.py patched.swf  patched.fws.swf
 ```
 
-`swf_inflate.py` accepts FWS (copied), CWS (zlib) and ZWS (LZMA, rebuilt into an LZMA alone header) and exits 3 for an unsupported or corrupt file. For CWS the conversion is `'FWS' + d[3:8] + zlib.decompress(d[8:])`. On the device the same job is done by the `atftool inflate <in> <out>` subcommand (doc 07), because there is no Python there.
+`swf_inflate.py <in.swf> <out.swf>` accepts FWS (copied unchanged), CWS (zlib) and ZWS (LZMA, rebuilt into an LZMA alone header). Exit codes: 0 ok, 1 usage, 2 unreadable input, 3 not a SWF or corrupt data. For CWS the conversion is `'FWS' + d[3:8] + zlib.decompress(d[8:])`. On the device the same job is done by `atftool inflate <in> <out>` (doc 07), which also handles CWS and ZWS, because there is no Python there. Both keep the version and length fields and only change the signature to `FWS`.
 
 ## 2. xdelta3 with `-S none`
 
@@ -40,9 +40,9 @@ xdelta3 -d -f -s orig.fws.swf out.xdelta /tmp/check.swf && cmp /tmp/check.swf ne
 tools/delivery/make_patch.sh original.swf patched.swf out/Shell.swf.xdelta
 ```
 
-It inflates both inputs, runs `xdelta3 -e -9 -S none`, and verifies the round trip with `xdelta3 -d` plus `cmp` before it reports success.
+It inflates both inputs, runs `xdelta3 -e -9 -S none -f -s`, and verifies the round trip with `xdelta3 -d` plus `cmp` before it writes the delta, so a bad delta is never left behind. It uses the local `xdelta3` (override with `XDELTA3=/path`) and otherwise runs it in a throwaway `alpine:3` Docker container, which needs network the first time. `USE_DOCKER=1` forces the container. Exit codes: 0 ok, 1 usage or missing input, 2 neither xdelta3 nor Docker, 3 encode or verify failed. It was tested with xdelta3 in a Docker alpine container.
 
-If xdelta3 is not installed on your PC, build deltas in a throwaway container and always force the architecture:
+To do the same by hand without xdelta3 on your PC, build deltas in a throwaway container and always force the architecture:
 
 ```
 docker run --rm --platform linux/amd64 -v "$PWD/fws:/w:ro" -v "$PWD/out:/out" alpine \
@@ -53,16 +53,16 @@ Pitfalls seen here: a local `alpine` image had silently become arm64, nothing ra
 
 ## 3. The device side patch step
 
-`tools/delivery/apply_patch.sh` is the generic device side apply. The contract of a patch step:
+Two pieces implement the same contract. `tools/delivery/apply_patch.sh` is the standalone, generic apply for one file. The template `templates/port/MYPORT/tools/patchscript` does the same for every row of a table (section 8) and is what a port normally ships. The contract of a patch step:
 
 1. Check the original exists, then check its md5 against the manifest (section 7). Missing file and wrong file are different errors.
-2. If there is no `<file>.orig`, move the original to `<file>.orig`. If the input is a fresh CWS file (see section 6), it replaces `.orig`.
-3. Inflate `.orig` to a temp file, apply the xdelta to a `.tmp` or `.new` file, then `mv -f` over the output. Never patch in place.
-4. A shell that becomes a new file (for example `Shell-port.swf`) is written next to the original. Sub movies are patched in place, with the original kept as `<file>.orig`.
+2. For an in place patch, keep the original as `<file>.orig` and always patch from `.orig`. A fresh copy of the game replaces `.orig` (section 6).
+3. Inflate the original to a temporary file, apply the xdelta to a `.new` file, then `mv -f` over the output. The input is never modified, so re running gives byte identical output and an interrupted run leaves nothing half written that the next run trusts.
+4. A shell that becomes a new file (for example `Shell-port.swf`) is written next to the original and the original stays untouched. Sub movies are usually patched in place, with the original kept as `<file>.orig`.
 
-Because every step reads `.orig` and writes a temp file before a rename, re running gives byte identical output and an interrupted run leaves nothing half written that the next run trusts.
+`apply_patch.sh [--step N --total M] [--text "label"] <original> <md5|-> <patch.xdelta> <output>` takes `xdelta3` from `$controlfolder/xdelta3` when executable, otherwise from `PATH`. The md5 `-` skips the check. It inflates with `atftool inflate` (found through `ATFTOOL`, next to the script, in the port's tools folder or on `PATH`) and falls back to an embedded python3 snippet that handles CWS and ZWS. It prints the lines the patcher screen reads (`[2/5] Patching World2.swf`, `ERROR: ...`, `PATCH_FAIL_MSG:Setup failed: ...`, `Patching process failed!`) and runs with `LC_ALL=C`. When sourced it defines `apply_swf_patch`, `fail`, `step`, `check_md5` and `inflate_file` and runs nothing. See `tools/delivery/README.md`.
 
-Keep a hard coded md5 table (or a manifest) for every SWF. Print an error that says what to do: `missing X. Copy the whole game folder into ports/<port>/gamedata/` or `X has an unexpected checksum (<sum>). Only the <store> release is supported.`
+Keep an md5 table (the manifest) for every SWF. Print an error that says what to do: `missing X. Copy the whole game folder into ports/<port>/gamedata/` or `X has an unexpected checksum (<sum>). Only the supported release of the game works.`
 
 ## 4. The patch version file
 
@@ -118,7 +118,8 @@ fi
 
 The user may copy the game again over a prepared install, or install an updated build. Decide per file what is "original":
 
-- A SWF whose first three bytes are `CWS` (`[ "$(head -c 3 "$f")" = "CWS" ]`) is a fresh store copy, because patched ones are stored as FWS. Move it over `.orig` with `mv -f "$f" "$f.orig"`.
+- `apply_patch.sh`: a file at the output path whose first three bytes are `CWS` or `ZWS` is a fresh store copy, because patched ones are stored as FWS. It is md5 checked and replaces `.orig`.
+- The template patchscript uses a different test that also works for stores that ship uncompressed SWFs: for an in place row, a file whose md5 equals the manifest entry is a fresh original and is moved over `.orig` (`mv -f "$orig" "$orig.orig"`). Anything else at that path is a leftover patched file, and the kept `.orig` is used.
 - An atlas XML that is neither the original nor its scaled version becomes the new original.
 - A freshly moved subfolder replaces the old one: `rm -rf dest && mv src dest`.
 
@@ -127,15 +128,15 @@ The user may copy the game again over a prepared install, or install an updated 
 For loose assets (level SWFs, ATF textures, atlas XMLs), generate a manifest at build time from the user's own copy:
 
 ```
-tools/delivery/make_manifest.sh /path/to/game 'Levels/*.swf' 'Levels/*.atf' '*.xml' > tools/patch/MYGAME_files.txt
+tools/delivery/make_manifest.sh /path/to/game 'Levels/*.swf' 'Levels/*.atf' '*.xml' > templates/port/MYPORT/tools/patch/manifest.txt
 ```
 
-The file is `md5 path` lines, sorted with `LC_ALL=C`, and contains no game content. Setup checks SWFs always, XMLs against `.orig`, and an ATF only when its PNG has to be made. Tested cases for the 42 entry example: fresh install, one PNG deleted, embedded PNG deleted, ATF missing, ATF damaged, XML and its `.orig` missing, level SWF missing, restored.
+The script prints to stdout (redirect it yourself). Each line is `<md5>  <relative path>` with two spaces, the `md5sum -c` format, sorted with `LC_ALL=C` so it is identical on every machine. Globs match file names, with no globs every regular file is listed. The file contains no game content, and `cd gamedata && md5sum -c ../tools/patch/manifest.txt` checks a copy of the game by hand. In the template port the manifest is `tools/patch/manifest.txt`, listing the originals the patchscript is allowed to use (paths relative to `gamedata/`). Setup checks SWFs always, XMLs against `.orig`, and an ATF only when its PNG has to be made. Tested cases for the 42 entry example: fresh install, one PNG deleted, embedded PNG deleted, ATF missing, ATF damaged, XML and its `.orig` missing, level SWF missing, restored.
 
 Convert only missing outputs:
 
-- Skip an ATF when the converted marker (`<world>/assets/.textures_converted`) exists and the matching `.png` exists.
-- Re extract an embedded atlas PNG only if it is missing.
+- Skip an `atf` job when the matching `.png` exists. Skip a `swf` extraction job when its marker `<outdir>/.done.<swf name>` exists. Both are what the template patchscript does for `tools/patch/atf.txt`.
+- Re extract embedded atlas PNGs only if the marker is missing (delete the `.done.*` file to force it).
 - Verify each PNG after conversion. Write to a temp file and rename (the converter does).
 - A deleted PNG is reconverted alone (8 seconds on the device in the example).
 
@@ -158,22 +159,22 @@ Protocol details:
 - `fail()` in your script: print `ERROR: msg`, `PATCH_FAIL_MSG:Setup failed: msg`, `Patching process failed!`, exit 1.
 - Require patcher.txt. If `$controlfolder/utils/patcher.txt` is missing, `pm_message "This port requires the latest version of PortMaster."` and exit. A fallback that ran `bash tools/patchscript` was a dead end: it was removed to match merged ports.
 - Call `pm_finish` before every error exit, otherwise PortMaster cleanup (gptokeyb and others) is skipped.
-- Rotate the setup log: `> patchlog.txt && exec > >(tee patchlog.txt) 2>&1`. The file name is relative on purpose.
+- Log the setup to `patchlog.txt` with `exec > >(tee "$GAMEDIR/patchlog.txt") 2>&1`, so it can be attached to a bug report.
 
-Script shape (`templates/port/MYPORT/tools/patchscript`):
+Script shape (`templates/port/MYPORT/tools/patchscript`, generic and driven by the tables in `tools/patch/`):
 
 ```
-GAMEDIR="${GAMEDIR:-$(dirname "$0")/..}"
-XDELTA="$controlfolder/xdelta3"; [ -x "$XDELTA" ] || XDELTA=xdelta3
-# 1 verify md5 and keep .orig
-# 2 patch every SWF from .orig (inflate, xdelta3 -d, mv -f)
-# 3 convert missing textures
-# 4 clean AIR files (narrow list)
-echo "$PATCH_VERSION" > "$GAMEDIR/gamedata/.port_patched"
-echo "=== Done. Enjoy! ==="
+GAMEDIR, DATADIR, PATCHDIR, ATFTOOL (tools/atftool), XDELTA ($controlfolder/xdelta3, else xdelta3 on PATH)
+exec > >(tee "$GAMEDIR/patchlog.txt") 2>&1
+plan:  count the steps from files.txt, atf.txt (only jobs still needed) and atlas.txt
+1  files.txt   "orig|patch|out": md5 check against manifest.txt, keep .orig, inflate, xdelta3 -d, mv -f
+2  atlas.txt   "factor|file.xml": always scaled from file.xml.orig with atftool atlasxml
+3  atf.txt     "kind|scale|input|outdir": atftool atf or atftool swf for what is still missing
+4  cleanup.txt one glob per line, relative to gamedata/, absolute paths and .. refused
+cat tools/patch/version > gamedata/.port_patched ; echo "=== Done. Enjoy! ==="
 ```
 
-Clean only what you know is dead: `rm -rf "Adobe AIR" META-INF ./*.exe ./*.dll mimetype` in gamedata. Never broader, and never name emulator folders.
+Clean only what you know is dead, and list it in `cleanup.txt` (for example `Adobe AIR`, `META-INF`, `*.exe`, `*.dll`, `mimetype`). Never broader, and never name emulator folders. The patchscript writes its log to `$GAMEDIR/patchlog.txt` (an absolute path, which is fine here because gptokeyb's kill name does not appear in it, unlike the launcher's log, see doc 11).
 
 First run time: about 1.5 minutes for 29 steps on an RG35XX H class device in the example, about 30 seconds on a PC, and 18 minutes for one unrelated port's conversion on an H700 with 2 threads. Report the real number to users. Compare device and PC outputs by size or md5 to validate the device path.
 

@@ -19,23 +19,25 @@ Header:
 | Offset | Size | Meaning |
 |---|---|---|
 | 0 | 3 | `ATF` |
-| 3 | 3 | Reserved. Byte 6 equal to `0xFF` means the file has a version byte (version greater than 0) |
-| 6 | 1 | `0xFF` marker (v3) |
-| 7 | 1 | Version (3) |
-| 8 | 4 | Length, big endian |
+| 3 | 3 | Total length of the file, u24 big endian |
+| 6 | 1 | `0xFF` marker. It means the file has a version byte (version 1 and later). If this byte is anything else the header is the legacy one (see below) |
+| 7 | 1 | Version (3 for the lossy formats) |
+| 8 | 4 | Length of the rest of the file, u32 big endian |
 | 12 | 1 | Format. Low 7 bits are the format, bit 7 is the cubemap flag |
 | 13 | 1 | log2 width |
 | 14 | 1 | log2 height |
 | 15 | 1 | Mip count |
 
-Per mip the data is a list of records, each a u32 big endian length followed by the payload. Version 0 files use 3 byte lengths. A "legacy header" therefore changes the length width, which the converter handles.
+In the legacy header (byte 6 is not `0xFF`) the format byte is already at offset 6, followed by log2 width, log2 height and the mip count, and the texture data starts at offset 10. `atftool` treats that as version 0.
+
+Per mip the data is a list of records, each a length followed by the payload. The length is u32 big endian for version 1 and later and u24 big endian for the legacy header, and the converter handles both.
 
 Formats and record counts per mip:
 
 | Format byte | Name | Records per mip |
 |---|---|---|
-| 0x02 | RGB or RGBA (JPEG XR family) | 11 |
-| 0x04 | CompressedAlpha | 16 |
+| 0x02 | Compressed (DXT1, not lossy) | 11 |
+| 0x04 | CompressedAlpha (DXT5, not lossy) | 16 |
 | 0x0C | CompressedLossy | 12 |
 | 0x0D | CompressedLossyAlpha | 17 |
 
@@ -86,30 +88,30 @@ Subcommands:
 ```
 atftool atf  <scale> <out_dir> <file.atf>...     # convert loose ATF files to PNG
 atftool swf  <scale> <out_dir> <file.swf>        # extract and convert embedded ATF
-atftool inflate <in.swf> <out.swf>               # CWS and ZWS to FWS
+atftool inflate <in.swf> <out.swf>               # CWS and ZWS to FWS (FWS is copied)
 atftool atlasxml <factor> <in.xml> <out.xml>     # scale atlas coordinates
+atftool info <file.atf>                          # print version, format, size, mips, record sizes
 ```
+
+Decoded formats are 0x02, 0x04, 0x0C and 0x0D (first mip of the first face). The uncompressed formats 0x00, 0x01 and the raw formats 0x03 and 0x05 are rejected with `unsupported ATF format`, and cubemaps decode only their first face. See `tools/atf/README.md`.
 
 Behaviour:
 
 - `<scale>` is a factor such as `1.0` or `0.5`. A 4096 square ATF at 0.5 becomes a 2048 PNG.
 - Output lines are `OK <path> [fmt WxH] Ns` or `ERR <name>: <error>`. Exit status is 0 on success, 1 if any file failed, 2 for usage errors.
 - The PNG is written to `<name>.png.tmp` and then renamed, so an interrupted run leaves no half file.
-- `swf` mode reads DefineBinaryData (tag 87) whose payload at offset 6 starts with `ATF`. It names the output from SymbolClass (tag 76): a class named `Foo_atf_Name` becomes `Name.png`. Fallback is `binary<id>`. It handles FWS, CWS and ZWS.
+- `swf` mode reads DefineBinaryData (tag 87) whose payload at offset 6 starts with `ATF`. It names the output from SymbolClass (tag 76). Naming is a heuristic: some build tools name embedded assets `<Something>_atf_<Name>`, and by default the part after the last `_atf_` is used (`Foo_atf_Sheet` becomes `Sheet.png`). Set `ATFTOOL_RAW_NAMES=1` to keep the full SymbolClass name instead. A class name without `_atf_` is used as is either way, and a tag with no SymbolClass entry becomes `binary<id>.png`. It handles FWS, CWS and ZWS.
 - Decoding goes through `texture2ddecoder` (BC1 or BC3), converts 0xAARRGGBB to RGBA, optionally resizes with a triangle filter, and writes PNG.
 - Cost on a PC: a 4096 square file takes 0.9 to 2.1 seconds, 2048 square 0.2 to 0.4 s. On an H700 class device about 1.5 minutes for 23 large textures, one patcher step per texture.
 
-Typical device side use inside the patch script:
+You normally do not write that loop yourself. The template patchscript reads `tools/patch/atf.txt` (one `kind|scale|input|outdir` line per job) and calls `atftool` for you, skipping jobs whose output already exists:
 
 ```
-"$TOOLS/atftool" swf 0.5 "$GAMEDIR/gamedata/World/assets/_embedded" "$GAMEDIR/gamedata/World.swf"
-for atf in $TODO_ATF; do
-  "$TOOLS/atftool" atf 0.5 "$(dirname "$atf")" "$atf" || fail "texture conversion failed: $atf"
-done
-touch "$GAMEDIR/gamedata/World/assets/.textures_converted"
+atf|0.5|World/level1.atf|World
+swf|0.5|World.swf.orig|World/assets/_embedded
 ```
 
-`TODO_ATF` comes from the md5 manifest and only lists ATFs whose PNG is missing (doc 03, section 7).
+An `atf` job is skipped when `<outdir>/<name>.png` exists (the converter renames a finished file into place, so an existing PNG is complete). A `swf` job is skipped when the marker `<outdir>/.done.<swf name>` exists, which the patchscript creates after a successful extraction. Atlas XML scaling is `tools/patch/atlas.txt` (`factor|file.xml`), see doc 03.
 
 ### Cross building
 
@@ -174,7 +176,7 @@ Keep the pristine `level1.xml.orig`. If the XML differs from `.orig` and from th
 - Scale constant in the patch script not equal to the scale in the SWF delta.
 - Halving pixel art that is not lossless to halve.
 - Quoting in the AS3 regex helper.
-- `atftool inflate` and ZWS: the Python reference accepts ZWS, check the built tool before you rely on it (`tools/atf/README.md`).
+- `atftool inflate` and `tools/swf/swf_inflate.py` both accept CWS and ZWS and copy FWS unchanged, so either can prepare a SWF for a delta.
 - Embedded ATF names that do not follow `Foo_atf_Name`: the output falls back to `binary<id>.png`. Check the log.
 - Building the converter without libclang for bindgen.
 - Leaving a half written PNG. Always write temp then rename, and verify each PNG after conversion.
