@@ -1,0 +1,329 @@
+From 4cd1994ace498948d9d9f735e4f82006264af965 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 09:09:41 -0400
+Subject: [PATCH 07/14] core: tessellate DefineShapes on first render, parse
+ shape records on demand
+
+Ruffle registered (tessellated) every DefineShape of a SWF while preloading
+it, and uploaded the bitmaps of the shapes bitmap fills at the same time. It
+also kept the parsed records of every shape for the life of the movie. For
+Fancy Pants Adventures World 2 (one SWF with every level) that was 4,255
+meshes (131 MB of vertex and index buffers), 44 bitmap fill textures (226 MB)
+and about 95 MB of shape records, most of it for levels that are not being
+played. The game was OOM-killed on 1 GB handhelds.
+
+* Lazy shapes (RUFFLE_LAZY_SHAPES=0 restores the old behaviour): a Graphic
+  made from a DefineShape tag no longer has a render handle from preload. It
+  is tessellated through the existing TessellationCache the first time it is
+  rendered, at the scale it is rendered at, and only then are its fill
+  bitmaps uploaded.
+* With eager tessellation still on, the preload handle (scale 1) now counts
+  as a cache entry within the cache scale range; before, the first render
+  tessellated the shape a second time and kept both meshes.
+* Lazy shape records (RUFFLE_LAZY_SHAPE_RECORDS=0 restores the old
+  behaviour): the DefineShape tag bytes are kept as a SwfSlice of the movie
+  data (already in memory), the parsed records are dropped after preload and
+  parsed again when the shape is first rendered, hit-tested or read as a
+  drawing (Graphics.readGraphicsData). A parse error logs and gives an empty
+  shape.
+
+World 2 Level 1 peak on the PC: 813 -> 351 MB (both changes). Rendering and
+collisions are unchanged (screenshots and a scripted walk through the level
+match the old build). The cost moves to the first time a shape is shown;
+Worlds 2 and 3 draw their level art into cache bitmaps while the level loads,
+so play is not affected there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/src/display_object/graphic.rs    | 145 +++++++++++++++++++++-----
+ core/src/display_object/movie_clip.rs |   8 +-
+ core/src/tessellation_cache.rs        |   4 +
+ 3 files changed, 132 insertions(+), 25 deletions(-)
+
+diff --git a/core/src/display_object/graphic.rs b/core/src/display_object/graphic.rs
+index b566e996..bc30f92e 100644
+--- a/core/src/display_object/graphic.rs
++++ b/core/src/display_object/graphic.rs
+@@ -8,7 +8,7 @@ use crate::display_object::{BoundsMode, DisplayObjectBase};
+ use crate::drawing::Drawing;
+ use crate::library::MovieLibrarySource;
+ use crate::prelude::*;
+-use crate::tag_utils::SwfMovie;
++use crate::tag_utils::{SwfMovie, SwfSlice};
+ use crate::tessellation_cache::TessellationCache;
+ use crate::vminterface::Instantiator;
+ use core::fmt;
+@@ -52,18 +52,40 @@ impl<'gc> Graphic<'gc> {
+         context: &mut UpdateContext<'gc>,
+         swf_shape: swf::Shape,
+         movie: Arc<SwfMovie>,
++        tag: Option<ShapeTag>,
+     ) -> Self {
+-        let library = context.library.library_for_movie(movie.clone()).unwrap();
++        // PortMaster port: with lazy shapes (the default, `RUFFLE_LAZY_SHAPES=0` turns it off)
++        // a shape is tessellated when it is first rendered, at the scale it is rendered at, and
++        // only then are the bitmaps of its fills uploaded. Registering every DefineShape at
++        // preload tessellated every level of a world (and uploaded all of their bitmaps) whether
++        // or not it was ever shown.
++        // PortMaster port (`RUFFLE_LAZY_SHAPE_RECORDS`, default on, "0" turns it off): with lazy
++        // shapes the parsed records are dropped after preload and parsed again from the tag's
++        // bytes when the shape is first rendered or hit-tested. They held about 95 MB for World 2
++        // of Fancy Pants Adventures, most of it shapes of levels that are not being played.
++        let lazy_records = lazy_shapes() && lazy_shape_records() && tag.is_some();
++        let render_handle = if lazy_shapes() {
++            None
++        } else {
++            let library = context.library.library_for_movie(movie.clone()).unwrap();
++            Some(
++                context
++                    .renderer
++                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
++            )
++        };
+         let shared = GraphicShared {
+             id: swf_shape.id,
+             shape_bounds: swf_shape.shape_bounds,
+             edge_bounds: swf_shape.edge_bounds,
+-            render_handle: Some(
+-                context
+-                    .renderer
+-                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
+-            ),
+-            shape: swf_shape,
++            render_handle,
++            tessellate: true,
++            shape: if lazy_records {
++                OnceCell::new()
++            } else {
++                OnceCell::from(swf_shape)
++            },
++            tag: if lazy_records { tag } else { None },
+             movie,
+             scaled_handle: RefCell::new(TessellationCache::new()),
+         };
+@@ -87,7 +109,9 @@ impl<'gc> Graphic<'gc> {
+             shape_bounds: Default::default(),
+             edge_bounds: Default::default(),
+             render_handle: None,
+-            shape: swf::Shape {
++            tessellate: false,
++            tag: None,
++            shape: OnceCell::from(swf::Shape {
+                 version: 32,
+                 id: 0,
+                 shape_bounds: Default::default(),
+@@ -98,7 +122,7 @@ impl<'gc> Graphic<'gc> {
+                     line_styles: Vec::new(),
+                 },
+                 shape: Vec::new(),
+-            },
++            }),
+             movie: context.root_swf.clone(),
+             scaled_handle: RefCell::new(TessellationCache::new()),
+         };
+@@ -128,7 +152,7 @@ impl<'gc> Graphic<'gc> {
+     pub fn drawing_snapshot(&self) -> Drawing {
+         match self.0.drawing.get() {
+             Some(drawing) => drawing.borrow().clone(),
+-            None => Drawing::from_swf_shape(&self.0.shared.get().shape),
++            None => Drawing::from_swf_shape(self.0.shared.get().shape()),
+         }
+     }
+ 
+@@ -144,9 +168,9 @@ impl<'gc> Graphic<'gc> {
+     fn get_or_retessellate_handle(
+         self,
+         context: &mut RenderContext,
+-        base_handle: &ShapeHandle,
++        base_handle: Option<&ShapeHandle>,
+         current_scale: f32,
+-    ) -> ShapeHandle {
++    ) -> Option<ShapeHandle> {
+         // Since graphics are created from a shared shape, we may be able to reuse a
+         // cached tessellation from another instance at a similar scale.
+         let shared = self.0.shared.get();
+@@ -155,7 +179,17 @@ impl<'gc> Graphic<'gc> {
+             let mut cache = shared.scaled_handle.borrow_mut();
+             if let Some(handle) = cache.find_near_and_touch(current_scale) {
+                 // Found a cached handle at a similar scale; reuse it.
+-                return handle;
++                return Some(handle);
++            }
++            // PortMaster port: the eagerly registered handle (scale 1) counts as a cached
++            // tessellation too; before, the first render at any scale tessellated the shape a
++            // second time and kept both meshes.
++            if let Some(base) = base_handle
++                && (TessellationCache::THRESHOLD_INVERSE..=TessellationCache::THRESHOLD)
++                    .contains(&current_scale)
++            {
++                cache.insert(1.0, base.clone());
++                return Some(base.clone());
+             }
+         }
+ 
+@@ -163,7 +197,7 @@ impl<'gc> Graphic<'gc> {
+         let library = context.library.library_for_movie(shared.movie.clone());
+         if let Some(library) = library {
+             let new_handle = context.renderer.register_shape_with_scale(
+-                (&shared.shape).into(),
++                shared.shape().into(),
+                 &MovieLibrarySource { library },
+                 current_scale,
+             );
+@@ -179,9 +213,9 @@ impl<'gc> Graphic<'gc> {
+                 cache.insert(current_scale, new_handle.clone());
+             }
+ 
+-            new_handle
++            Some(new_handle)
+         } else {
+-            base_handle.clone()
++            base_handle.cloned()
+         }
+     }
+ }
+@@ -264,7 +298,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
+ 
+         if let Some(drawing) = self.0.drawing.get() {
+             drawing.borrow().render(context);
+-        } else if let Some(base_handle) = self.0.shared.get().render_handle.clone() {
++        } else if self.0.shared.get().tessellate {
+             let transform = context.transform_stack.transform();
+ 
+             // Calculate the current scale from the transform, to determine if
+@@ -274,9 +308,12 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
+             let scale_y = f32::abs(matrix.b + matrix.d);
+             let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
+ 
+-            let handle = self.get_or_retessellate_handle(context, &base_handle, current_scale);
+-
+-            context.commands.render_shape(handle, transform)
++            let base_handle = self.0.shared.get().render_handle.clone();
++            if let Some(handle) =
++                self.get_or_retessellate_handle(context, base_handle.as_ref(), current_scale)
++            {
++                context.commands.render_shape(handle, transform)
++            }
+         }
+     }
+ 
+@@ -299,8 +336,12 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
+                     return true;
+                 }
+             } else {
+-                let shape = &self.0.shared.get().shape;
+-                return ruffle_render::shape_utils::shape_hit_test(shape, point, &local_matrix);
++                let shared = self.0.shared.get();
++                return ruffle_render::shape_utils::shape_hit_test(
++                    shared.shape(),
++                    point,
++                    &local_matrix,
++                );
+             }
+         }
+ 
+@@ -346,11 +387,67 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
+ #[collect(require_static)]
+ struct GraphicShared {
+     id: CharacterId,
+-    shape: swf::Shape,
++    /// The parsed shape records; parsed on demand from `tag` with lazy shape records.
++    shape: OnceCell<swf::Shape>,
++    /// PortMaster port: where to parse `shape` from (lazy shape records).
++    tag: Option<ShapeTag>,
+     render_handle: Option<ShapeHandle>,
++    /// PortMaster port: `shape` is rendered (false for an empty Graphic).
++    tessellate: bool,
+     shape_bounds: Rectangle<Twips>,
+     edge_bounds: Rectangle<Twips>,
+     movie: Arc<SwfMovie>,
+     #[collect(require_static)]
+     scaled_handle: RefCell<TessellationCache>,
+ }
++
++/// PortMaster port: `RUFFLE_LAZY_SHAPES` (default on; "0" turns it off): DefineShape characters are
++/// tessellated when first rendered instead of at preload.
++fn lazy_shapes() -> bool {
++    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *LAZY.get_or_init(|| std::env::var("RUFFLE_LAZY_SHAPES").map_or(true, |v| v != "0"))
++}
++
++/// PortMaster port: the bytes of a DefineShape tag, kept to parse its records on demand.
++pub struct ShapeTag {
++    pub slice: SwfSlice,
++    /// SWF version of the movie (for the reader).
++    pub swf_version: u8,
++    /// DefineShape version (1 to 4).
++    pub version: u8,
++}
++
++impl GraphicShared {
++    /// The shape records, parsed from the tag on first use (lazy shape records).
++    fn shape(&self) -> &swf::Shape {
++        self.shape.get_or_init(|| {
++            let tag = self.tag.as_ref().expect("a lazy shape keeps its tag");
++            let mut reader = swf::read::Reader::new(tag.slice.data(), tag.swf_version);
++            match reader.read_define_shape(tag.version) {
++                Ok(shape) => shape,
++                Err(e) => {
++                    tracing::error!("Failed to parse shape {} again: {e}", self.id);
++                    swf::Shape {
++                        version: tag.version,
++                        id: self.id,
++                        shape_bounds: self.shape_bounds,
++                        edge_bounds: self.edge_bounds,
++                        flags: swf::ShapeFlag::empty(),
++                        styles: swf::ShapeStyles {
++                            fill_styles: Vec::new(),
++                            line_styles: Vec::new(),
++                        },
++                        shape: Vec::new(),
++                    }
++                }
++            }
++        })
++    }
++}
++
++/// PortMaster port: `RUFFLE_LAZY_SHAPE_RECORDS` (default on; "0" turns it off), see
++/// `Graphic::from_swf_tag`.
++fn lazy_shape_records() -> bool {
++    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *LAZY.get_or_init(|| std::env::var("RUFFLE_LAZY_SHAPE_RECORDS").map_or(true, |v| v != "0"))
++}
+diff --git a/core/src/display_object/movie_clip.rs b/core/src/display_object/movie_clip.rs
+index 63b3eae7..42e0a827 100644
+--- a/core/src/display_object/movie_clip.rs
++++ b/core/src/display_object/movie_clip.rs
+@@ -3543,9 +3543,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+         reader: &mut SwfStream<'a>,
+         version: u8,
+     ) -> Result<(), Error> {
++        // PortMaster port: the tag's bytes, to parse the shape records again on demand
++        let tag = crate::display_object::graphic::ShapeTag {
++            slice: SwfSlice::from(self.movie()).to_subslice(reader.get_ref()),
++            swf_version: reader.version(),
++            version,
++        };
+         let swf_shape = reader.read_define_shape(version)?;
+         let id = swf_shape.id;
+-        let graphic = Graphic::from_swf_tag(context, swf_shape, self.movie());
++        let graphic = Graphic::from_swf_tag(context, swf_shape, self.movie(), Some(tag));
+         self.library_mut(context)
+             .register_character(id, Character::Graphic(graphic));
+         Ok(())
+diff --git a/core/src/tessellation_cache.rs b/core/src/tessellation_cache.rs
+index cacd8538..f93b709e 100644
+--- a/core/src/tessellation_cache.rs
++++ b/core/src/tessellation_cache.rs
+@@ -24,6 +24,10 @@ pub(crate) struct TessellationCache {
+ ///
+ /// This is used to avoid retessellating shapes at similar scales multiple times, which can be expensive.
+ impl TessellationCache {
++    /// PortMaster port: the scale ratios within which a cached tessellation is reused.
++    pub(crate) const THRESHOLD: f32 = RETESSELLATION_SCALE_THRESHOLD;
++    pub(crate) const THRESHOLD_INVERSE: f32 = RETESSELLATION_SCALE_THRESHOLD_INVERSE;
++
+     /// Creates a new, empty tessellation cache.
+     pub(crate) fn new() -> Self {
+         Self {

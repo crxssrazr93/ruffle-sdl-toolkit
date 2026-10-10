@@ -1,0 +1,998 @@
+From 9d04e524fed2a8e286c06376131abb1f51f92a4d Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 08:37:23 -0400
+Subject: [PATCH 11/14] PortMaster port: Stage3D uploads without a submit,
+ consecutive draws in one render pass
+
+RUFFLE_S3D_DEFER_UPLOAD (default on, 0 = old path): a GPU-side Texture.uploadFromBitmapData
+no longer submits the renderer's pending work and then the Stage3D encoder (two queue submits,
+each a full GL replay plus glFlush on GLES). Both are finished into command buffers and queued
+in Descriptors::deferred_command_buffers; every queue submit (renderer or Stage3D) takes the
+queue first, so the copy still runs after the offscreen draws it reads and before anything
+recorded later.
+
+RUFFLE_S3D_MERGE_PASSES (default on, 0 = old path): drawTriangles joins a pending render pass
+on the current target instead of opening its own; the pass is recorded on a target change,
+clear, present, or an upload into a buffer or texture it uses. Program constants are kept on
+the CPU and copied per draw into a 1 MB uniform ring bound with dynamic offsets, one copy per
+pass. Hub on PC: about 30 passes per frame -> about 4.
+
+PM_GPUSTAT=1 also logs submits, queued buffers, presents, Stage3D passes, draws and early pass
+ends every 2 s (target pmgpu).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ render/wgpu/src/backend.rs                    |  40 +-
+ render/wgpu/src/context3d/current_pipeline.rs |  41 +-
+ render/wgpu/src/context3d/mod.rs              | 492 ++++++++++++++++--
+ render/wgpu/src/context3d/shader_pair.rs      |   4 +-
+ render/wgpu/src/descriptors.rs                |  35 ++
+ render/wgpu/src/lib.rs                        |   1 +
+ render/wgpu/src/pmstat.rs                     |  72 +++
+ 7 files changed, 639 insertions(+), 46 deletions(-)
+ create mode 100644 render/wgpu/src/pmstat.rs
+
+diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
+index 5bfd6c39..6562873f 100644
+--- a/render/wgpu/src/backend.rs
++++ b/render/wgpu/src/backend.rs
+@@ -900,7 +900,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+ 
+     #[instrument(level = "debug", skip_all)]
+     fn flush_pending_gpu_work(&mut self) {
+-        self.active_frame.submit_direct(&self.descriptors);
++        if crate::descriptors::s3d_defer_upload() {
++            // Queued, not submitted: the Stage3D copy that needs this work queues itself right
++            // after it, and every submit takes the queue first (`deferred_command_buffers`).
++            self.active_frame.defer(&self.descriptors);
++        } else {
++            self.active_frame.submit_direct(&self.descriptors);
++        }
+     }
+ 
+     fn render_offscreen(
+@@ -1472,12 +1478,11 @@ impl ActiveFrame {
+                 .device
+                 .create_command_encoder(&Default::default()),
+         );
+-        let index = target.submit(
+-            &descriptors.device,
+-            &descriptors.queue,
+-            Some(draw_encoder.finish()),
+-            frame,
+-        );
++        let mut buffers = descriptors.take_deferred_command_buffers();
++        buffers.push(draw_encoder.finish());
++        crate::pmstat::add(crate::pmstat::C::Submit, 1);
++        crate::pmstat::add(crate::pmstat::C::SubmitBuffers, buffers.len() as u64);
++        let index = target.submit(&descriptors.device, &descriptors.queue, buffers, frame);
+         self.staging_belt.recall();
+         index
+     }
+@@ -1491,11 +1496,30 @@ impl ActiveFrame {
+                 .device
+                 .create_command_encoder(&Default::default()),
+         );
+-        let index = descriptors.queue.submit(Some(draw_encoder.finish()));
++        let mut buffers = descriptors.take_deferred_command_buffers();
++        buffers.push(draw_encoder.finish());
++        crate::pmstat::add(crate::pmstat::C::Submit, 1);
++        crate::pmstat::add(crate::pmstat::C::SubmitBuffers, buffers.len() as u64);
++        let index = descriptors.queue.submit(buffers);
+         self.staging_belt.recall();
+         index
+     }
+ 
++    /// PortMaster port: finish what is recorded so far and queue it for the next submit (every
++    /// submit takes the queue first, so it still runs before everything recorded after it). The
++    /// staging belt chunks it uses stay closed until the next `recall`, which always follows a
++    /// submit.
++    pub fn defer(&mut self, descriptors: &Descriptors) {
++        self.staging_belt.finish();
++        let draw_encoder = std::mem::replace(
++            &mut self.command_encoder,
++            descriptors
++                .device
++                .create_command_encoder(&Default::default()),
++        );
++        descriptors.defer_command_buffer(draw_encoder.finish());
++    }
++
+     pub fn maybe_flush(&mut self, descriptors: &Descriptors) {
+         // [NA] This is kind of a hack.
+         // If we do "too much" during one frame, the submission ends up being way too large and goes OutOfMemory.
+diff --git a/render/wgpu/src/context3d/current_pipeline.rs b/render/wgpu/src/context3d/current_pipeline.rs
+index c37a4311..4f4d5083 100644
+--- a/render/wgpu/src/context3d/current_pipeline.rs
++++ b/render/wgpu/src/context3d/current_pipeline.rs
+@@ -67,11 +67,16 @@ const AGAL_NUM_VERTEX_CONSTANTS: u64 = 128;
+ const AGAL_NUM_FRAGMENT_CONSTANTS: u64 = 28;
+ pub(super) const AGAL_FLOATS_PER_REGISTER: u64 = 4;
+ 
+-const VERTEX_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
++pub(super) const VERTEX_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
+     AGAL_NUM_VERTEX_CONSTANTS * AGAL_FLOATS_PER_REGISTER * std::mem::size_of::<f32>() as u64;
+-const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
++pub(super) const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
+     AGAL_NUM_FRAGMENT_CONSTANTS * AGAL_FLOATS_PER_REGISTER * std::mem::size_of::<f32>() as u64;
+ 
++/// PortMaster port (`RUFFLE_S3D_MERGE_PASSES`): size of the ring the program constants of each
++/// draw are copied into (bound with dynamic offsets). About 400 draws' worth when every draw
++/// changes both sets; when it is full the pending pass ends and writing starts over at 0.
++pub(super) const UNIFORM_RING_SIZE: u64 = 1 << 20;
++
+ // The flash Context3D API is similar to OpenGL - it has many methods
+ // which modify the current state (`setVertexBufferAt`, `setCulling`, etc.)
+ // These methods can be called at any time.
+@@ -97,6 +102,9 @@ pub struct CurrentPipeline {
+ 
+     pub vertex_shader_uniforms: Buffer,
+     pub fragment_shader_uniforms: Buffer,
++    /// PortMaster port (`RUFFLE_S3D_MERGE_PASSES`): bound instead of the two buffers above,
++    /// with dynamic offsets.
++    pub uniform_ring: Option<Buffer>,
+ 
+     has_depth_texture: bool,
+ 
+@@ -175,7 +183,15 @@ pub struct BoundTextureData {
+ }
+ 
+ impl CurrentPipeline {
+-    pub fn new(descriptors: &Descriptors) -> Self {
++    pub fn new(descriptors: &Descriptors, merge_passes: bool) -> Self {
++        let uniform_ring = merge_passes.then(|| {
++            descriptors.device.create_buffer(&BufferDescriptor {
++                label: Some("Stage3D uniform ring"),
++                size: UNIFORM_RING_SIZE,
++                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
++                mapped_at_creation: false,
++            })
++        });
+         let vertex_shader_uniforms = descriptors.device.create_buffer(&BufferDescriptor {
+             label: Some("Vertex shader uniforms"),
+             size: VERTEX_SHADER_UNIFORMS_BUFFER_SIZE,
+@@ -195,6 +211,7 @@ impl CurrentPipeline {
+             bound_textures: std::array::from_fn(|_| None),
+             vertex_shader_uniforms,
+             fragment_shader_uniforms,
++            uniform_ring,
+             dirty: Cell::new(true),
+             culling: Context3DTriangleFace::None,
+ 
+@@ -260,6 +277,14 @@ impl CurrentPipeline {
+         self.bound_textures[index] = texture;
+     }
+ 
++    /// PortMaster port: addresses of the bound textures (see `PendingPass::uses`).
++    pub fn bound_texture_addresses(&self) -> impl Iterator<Item = usize> + '_ {
++        self.bound_textures
++            .iter()
++            .flatten()
++            .map(|bound| Rc::as_ptr(&bound.id) as *const () as usize)
++    }
++
+     /// Forget cached bind groups (they keep their textures alive).
+     pub fn forget_bind_groups(&self) {
+         self.bind_group_cache.borrow_mut().clear();
+@@ -395,7 +420,10 @@ impl CurrentPipeline {
+             BindGroupEntry {
+                 binding: 0,
+                 resource: BindingResource::Buffer(wgpu::BufferBinding {
+-                    buffer: &self.vertex_shader_uniforms,
++                    buffer: self
++                        .uniform_ring
++                        .as_ref()
++                        .unwrap_or(&self.vertex_shader_uniforms),
+                     offset: 0,
+                     size: Some(NonZeroU64::new(VERTEX_SHADER_UNIFORMS_BUFFER_SIZE).unwrap()),
+                 }),
+@@ -403,7 +431,10 @@ impl CurrentPipeline {
+             BindGroupEntry {
+                 binding: 1,
+                 resource: BindingResource::Buffer(wgpu::BufferBinding {
+-                    buffer: &self.fragment_shader_uniforms,
++                    buffer: self
++                        .uniform_ring
++                        .as_ref()
++                        .unwrap_or(&self.fragment_shader_uniforms),
+                     offset: 0,
+                     size: Some(NonZeroU64::new(FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE).unwrap()),
+                 }),
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index ccec04d3..86f47c65 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -91,6 +91,20 @@ pub struct WgpuContext3D {
+     seen_clear_command: bool,
+ 
+     scissor_rectangle: Option<Rectangle<Twips>>,
++
++    // PortMaster port (`RUFFLE_S3D_MERGE_PASSES`, see `PendingPass`): draws not yet recorded,
++    // the CPU copies of the program constants, where their current values sit in the uniform
++    // ring (`None`: changed since, needs a new copy) and the ring's write position.
++    merge_passes: bool,
++    pending_pass: Option<PendingPass>,
++    vertex_constants: Vec<u8>,
++    fragment_constants: Vec<u8>,
++    vertex_constants_at: Option<u64>,
++    fragment_constants_at: Option<u64>,
++    uniform_ring_cursor: u64,
++    uniform_align: u64,
++    /// Address of the texture we render to (`None`: the back buffer)
++    current_target: Option<usize>,
+ }
+ 
+ impl WgpuContext3D {
+@@ -129,7 +143,11 @@ impl WgpuContext3D {
+ 
+         // FIXME - determine the best chunk size for this
+         let buffer_staging_belt = StagingBelt::new(descriptors.device.clone(), 1 << 16);
+-        let current_pipeline = CurrentPipeline::new(&descriptors);
++        let current_pipeline = CurrentPipeline::new(&descriptors, s3d_merge_passes());
++        let uniform_align = descriptors
++            .limits
++            .min_uniform_buffer_offset_alignment
++            .max(16);
+ 
+         Self {
+             profile,
+@@ -161,18 +179,243 @@ impl WgpuContext3D {
+             clear_color: None,
+             seen_clear_command: false,
+             scissor_rectangle: None,
++
++            merge_passes: s3d_merge_passes(),
++            pending_pass: None,
++            vertex_constants: vec![
++                0;
++                current_pipeline::VERTEX_SHADER_UNIFORMS_BUFFER_SIZE as usize
++            ],
++            fragment_constants: vec![
++                0;
++                current_pipeline::FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE as usize
++            ],
++            vertex_constants_at: None,
++            fragment_constants_at: None,
++            uniform_ring_cursor: 0,
++            uniform_align: uniform_align as u64,
++            current_target: None,
+         }
+     }
+ 
+-    /// Submits everything recorded for this frame.
++    /// Submits everything recorded for this frame (after the command buffers queued by
++    /// `RUFFLE_S3D_DEFER_UPLOAD`, which must run first).
+     fn flush(&mut self) {
+-        if let Some(encoder) = self.buffer_command_encoder.take() {
++        self.end_pending_pass();
++        let mut buffers = self.descriptors.take_deferred_command_buffers();
++        let own = self.buffer_command_encoder.take();
++        if own.is_some() {
+             self.buffer_staging_belt.finish();
+-            self.descriptors.queue.submit([encoder.finish()]);
++        }
++        buffers.extend(own.map(|encoder| encoder.finish()));
++        if !buffers.is_empty() {
++            crate::pmstat::add(crate::pmstat::C::Submit, 1);
++            crate::pmstat::add(crate::pmstat::C::SubmitBuffers, buffers.len() as u64);
++            self.descriptors.queue.submit(buffers);
+             self.buffer_staging_belt.recall();
+         }
+     }
+ 
++    /// PortMaster port (`RUFFLE_S3D_DEFER_UPLOAD`): queue what is recorded so far for the next
++    /// submit instead of submitting it. Draws still pending (`pending_pass`) stay pending: they
++    /// do not touch what was recorded before them. Our staging belt is only recalled in `flush`,
++    /// after a submit that took the queue.
++    fn defer(&mut self) {
++        if let Some(encoder) = self.buffer_command_encoder.take() {
++            self.buffer_staging_belt.finish();
++            self.descriptors.defer_command_buffer(encoder.finish());
++        }
++    }
++
++    /// PortMaster port (`RUFFLE_S3D_MERGE_PASSES`): ends the pending pass early if it uses the
++    /// buffer or texture at `address` (which is about to be written to; the write is recorded
++    /// right away, so it would land before the pending draws).
++    fn end_pending_pass_if_uses(&mut self, address: usize, reason: crate::pmstat::C) {
++        if self
++            .pending_pass
++            .as_ref()
++            .is_some_and(|pass| pass.target == Some(address) || pass.uses.contains(&address))
++        {
++            crate::pmstat::add(reason, 1);
++            self.end_pending_pass();
++        }
++    }
++
++    /// PortMaster port: records the pending draws as one render pass, after one copy of the
++    /// program constants they use into the uniform ring.
++    fn end_pending_pass(&mut self) {
++        let Some(pass) = self.pending_pass.take() else {
++            return;
++        };
++        let encoder = frame_encoder(&mut self.buffer_command_encoder, &self.descriptors.device);
++        if let (Some(size), Some(ring)) = (
++            NonZeroU64::new(pass.uniforms.len() as u64),
++            self.current_pipeline.uniform_ring.as_ref(),
++        ) {
++            self.buffer_staging_belt
++                .write_buffer(encoder, ring, pass.uniform_base, size)
++                .copy_from_slice(&pass.uniforms);
++        }
++        encode_pending_pass(encoder, &pass);
++    }
++
++    /// PortMaster port: starts a pending pass on the current target, taking a pending clear
++    /// like `make_render_pass`.
++    fn begin_pending_pass(&mut self) {
++        let clear_color = self.clear_color.take();
++        let color_load = match clear_color {
++            Some(clear) if clear.mask & COLOR_MASK != 0 => wgpu::LoadOp::Clear(clear.rgb),
++            _ => wgpu::LoadOp::Load,
++        };
++        let depth_load = match clear_color {
++            Some(clear) if clear.mask & DEPTH_MASK != 0 => wgpu::LoadOp::Clear(clear.depth),
++            _ => wgpu::LoadOp::Load,
++        };
++        let stencil_load = match clear_color {
++            Some(clear) if clear.mask & STENCIL_MASK != 0 => wgpu::LoadOp::Clear(clear.stencil),
++            _ => wgpu::LoadOp::Load,
++        };
++        self.pending_pass = Some(PendingPass {
++            color_view: self.current_texture_view.clone().unwrap(),
++            resolve_view: self.current_texture_resolve_view.clone(),
++            depth_view: self.current_depth_texture_view.clone(),
++            color_load,
++            depth_load,
++            stencil_load,
++            size: self.current_texture_size.unwrap(),
++            target: self.current_target,
++            draws: Vec::new(),
++            uses: Vec::new(),
++            uniform_base: self.uniform_ring_cursor,
++            uniforms: Vec::new(),
++        });
++    }
++
++    /// PortMaster port: the ring offset of the current vertex (or fragment) constants, copying
++    /// them into the pending pass's uniform data if they changed since their last copy.
++    fn constants_at(&mut self, vertex: bool) -> u64 {
++        let (at, data) = if vertex {
++            (&mut self.vertex_constants_at, &self.vertex_constants)
++        } else {
++            (&mut self.fragment_constants_at, &self.fragment_constants)
++        };
++        if let Some(at) = *at {
++            return at;
++        }
++        let pass = self.pending_pass.as_mut().unwrap();
++        let offset = self.uniform_ring_cursor;
++        debug_assert_eq!(pass.uniform_base + pass.uniforms.len() as u64, offset);
++        pass.uniforms.extend_from_slice(data);
++        let padded = (data.len() as u64).next_multiple_of(self.uniform_align);
++        pass.uniforms
++            .resize((offset + padded - pass.uniform_base) as usize, 0);
++        self.uniform_ring_cursor = offset + padded;
++        *at = Some(offset);
++        offset
++    }
++
++    /// PortMaster port (`RUFFLE_S3D_MERGE_PASSES`): `drawTriangles` without a render pass of its
++    /// own: the draw joins the pending pass.
++    fn record_draw(
++        &mut self,
++        index_buffer: &IndexBufferWrapper,
++        indices: std::ops::Range<u32>,
++        draw: bool,
++    ) {
++        let align = self.uniform_align;
++        let needed = |at: Option<u64>, size: u64| {
++            if at.is_some() {
++                0
++            } else {
++                size.next_multiple_of(align)
++            }
++        };
++        let need = needed(self.vertex_constants_at, self.vertex_constants.len() as u64)
++            + needed(
++                self.fragment_constants_at,
++                self.fragment_constants.len() as u64,
++            );
++        if self.uniform_ring_cursor + need > current_pipeline::UNIFORM_RING_SIZE {
++            if self.pending_pass.is_some() {
++                crate::pmstat::add(crate::pmstat::C::BreakRing, 1);
++            }
++            self.end_pending_pass();
++            self.uniform_ring_cursor = 0;
++            self.vertex_constants_at = None;
++            self.fragment_constants_at = None;
++        }
++        if self.pending_pass.is_none() {
++            self.begin_pending_pass();
++        }
++        let offsets = [
++            self.constants_at(true) as u32,
++            self.constants_at(false) as u32,
++        ];
++
++        let scissor = if let Some(rect) = &self.scissor_rectangle {
++            let current_size = self.current_texture_size.unwrap();
++            if rect.x_min.to_pixels() < 0.0
++                || rect.y_min.to_pixels() < 0.0
++                || rect.x_max.to_pixels() as u32 > current_size.width
++                || rect.y_max.to_pixels() as u32 > current_size.height
++                || rect.x_min == rect.x_max
++                || rect.y_min == rect.y_max
++            {
++                // FIXME - throw an error when Context3D.enableErrorChecking is set
++                tracing::error!(
++                    "Invalid scissor rectangle {:?} for texture size {:?}",
++                    rect,
++                    current_size
++                );
++                self.scissor_rectangle = None;
++                None
++            } else {
++                Some([
++                    rect.x_min.to_pixels() as u32,
++                    rect.y_min.to_pixels() as u32,
++                    rect.width().to_pixels() as u32,
++                    rect.height().to_pixels() as u32,
++                ])
++            }
++        } else {
++            None
++        };
++
++        let pass = self.pending_pass.as_mut().unwrap();
++        let mut add_use = |address: usize| {
++            if !pass.uses.contains(&address) {
++                pass.uses.push(address);
++            }
++        };
++        // The same distinct buffers in the same order as `make_render_pass`
++        let mut seen: Vec<&Rc<VertexBufferWrapper>> = Vec::new();
++        for attr in self.vertex_attributes.iter().flatten() {
++            if !seen.iter().any(|b| Rc::ptr_eq(b, &attr.buffer)) {
++                seen.push(&attr.buffer);
++            }
++        }
++        let vertex_buffers: Vec<wgpu::Buffer> = seen.iter().map(|b| b.buffer.clone()).collect();
++        for b in &seen {
++            add_use(Rc::as_ptr(b) as usize);
++        }
++        add_use(index_buffer as *const IndexBufferWrapper as usize);
++        for address in self.current_pipeline.bound_texture_addresses() {
++            add_use(address);
++        }
++        crate::pmstat::add(crate::pmstat::C::Draw, 1);
++        pass.draws.push(PendingDraw {
++            draw: draw && self.compiled_pipeline.is_some() && self.bind_group.is_some(),
++            pipeline: self.compiled_pipeline.clone(),
++            bind_group: self.bind_group.clone(),
++            offsets,
++            vertex_buffers,
++            index_buffer: index_buffer.buffer.clone(),
++            indices,
++            scissor,
++            stencil_ref: self.current_pipeline.stencil_ref_value(),
++        });
++    }
++
+     fn create_depth_texture(&self, width: u32, height: u32, sample_count: u32) -> TextureView {
+         self.descriptors
+             .device
+@@ -197,6 +440,8 @@ impl WgpuContext3D {
+     // from ActionScript via Context3D.setRenderToBackBuffer(), or automatically
+     // when calling Context3D.present()
+     fn set_render_to_back_buffer(&mut self) {
++        self.end_pending_pass();
++        self.current_target = None;
+         self.current_texture_size = self.back_buffer_size;
+         self.current_texture_view = self.back_buffer_texture_view.clone();
+         self.current_texture_resolve_view = self.back_buffer_resolve_texture_view.clone();
+@@ -520,6 +765,8 @@ impl Context3D for WgpuContext3D {
+                 stencil,
+                 mask,
+             } => {
++                // The pending draws come before this clear.
++                self.end_pending_pass();
+                 self.clear_color = Some(ClearColor {
+                     rgb: wgpu::Color {
+                         r: red,
+@@ -541,6 +788,7 @@ impl Context3D for WgpuContext3D {
+                 wants_best_resolution: _,
+                 wants_best_resolution_on_browser_zoom: _,
+             } => {
++                self.end_pending_pass();
+                 let format = wgpu::TextureFormat::Rgba8Unorm;
+ 
+                 let mut sample_count = anti_alias;
+@@ -715,6 +963,10 @@ impl Context3D for WgpuContext3D {
+                     return;
+                 }
+                 let buffer: &mut IndexBufferWrapper = <dyn Any>::downcast_mut(buffer).unwrap();
++                self.end_pending_pass_if_uses(
++                    buffer as *const IndexBufferWrapper as usize,
++                    crate::pmstat::C::BreakBuffer,
++                );
+ 
+                 // Unfortunately, ActionScript works with 2-byte indices, while wgpu requires
+                 // copy offsets and sizes to have 4-byte alignment. To support this, we need
+@@ -755,6 +1007,10 @@ impl Context3D for WgpuContext3D {
+ 
+                 let buffer: Rc<VertexBufferWrapper> =
+                     Rc::<dyn Any>::downcast(buffer.clone()).unwrap();
++                self.end_pending_pass_if_uses(
++                    Rc::as_ptr(&buffer) as usize,
++                    crate::pmstat::C::BreakBuffer,
++                );
+ 
+                 // ActionScript can only work with 32-bit chunks of data, so our `write_buffer`
+                 // offset and size will always be a multiple of `COPY_BUFFER_ALIGNMENT` (4 bytes)
+@@ -776,6 +1032,8 @@ impl Context3D for WgpuContext3D {
+                 anti_alias,
+                 surface_selector,
+             } => {
++                self.end_pending_pass();
++                self.current_target = Some(Rc::as_ptr(&texture) as *const () as usize);
+                 let mut sample_count = anti_alias;
+                 if sample_count == 0 {
+                     sample_count = 1;
+@@ -898,6 +1156,13 @@ impl Context3D for WgpuContext3D {
+                     self.bind_group = Some(new_bind_group);
+                 }
+ 
++                if self.merge_passes {
++                    self.record_draw(index_buffer, indices, !unbound_required_textures);
++                    return;
++                }
++                crate::pmstat::add(crate::pmstat::C::Pass, 1);
++                crate::pmstat::add(crate::pmstat::C::Draw, 1);
++
+                 // The render pass goes into the frame encoder after any buffer copies recorded
+                 // so far, so it sees them; later copies come after it.
+                 let mut render_command_encoder = self
+@@ -957,6 +1222,28 @@ impl Context3D for WgpuContext3D {
+                 if matrix_raw_data_column_major.is_empty() {
+                     return;
+                 }
++                if self.merge_passes {
++                    // Kept on the CPU; each draw copies the values it uses into the uniform ring.
++                    let (constants, at) = match program_type {
++                        ProgramType::Vertex => {
++                            (&mut self.vertex_constants, &mut self.vertex_constants_at)
++                        }
++                        ProgramType::Fragment => (
++                            &mut self.fragment_constants,
++                            &mut self.fragment_constants_at,
++                        ),
++                    };
++                    let data = matrix_raw_data_column_major.as_flattened();
++                    let offset = first_register as usize
++                        * AGAL_FLOATS_PER_REGISTER as usize
++                        * std::mem::size_of::<f32>();
++                    let end = (offset + data.len()).min(constants.len());
++                    if offset < end {
++                        constants[offset..end].copy_from_slice(&data[..end - offset]);
++                        *at = None;
++                    }
++                    return;
++                }
+                 let buffer = match program_type {
+                     ProgramType::Vertex => &self.current_pipeline.vertex_shader_uniforms,
+                     ProgramType::Fragment => &self.current_pipeline.fragment_shader_uniforms,
+@@ -989,6 +1276,10 @@ impl Context3D for WgpuContext3D {
+                 dest,
+                 layer,
+             } => {
++                self.end_pending_pass_if_uses(
++                    Rc::as_ptr(&dest) as *const () as usize,
++                    crate::pmstat::C::BreakTexture,
++                );
+                 let dest = Rc::<dyn Any>::downcast::<TextureWrapper>(dest).unwrap();
+                 if dest.disposed.get() {
+                     return;
+@@ -1047,32 +1338,32 @@ impl Context3D for WgpuContext3D {
+ 
+                 frame_encoder(&mut self.buffer_command_encoder, &self.descriptors.device)
+                     .copy_buffer_to_texture(
+-                    wgpu::TexelCopyBufferInfo {
+-                        buffer: &texture_buffer,
+-                        // The copy source uses the padded image data, with larger rows
+-                        layout: wgpu::TexelCopyBufferLayout {
+-                            offset: 0,
+-                            bytes_per_row: Some(dest_bytes_per_row),
+-                            rows_per_image: Some(rows_per_image),
++                        wgpu::TexelCopyBufferInfo {
++                            buffer: &texture_buffer,
++                            // The copy source uses the padded image data, with larger rows
++                            layout: wgpu::TexelCopyBufferLayout {
++                                offset: 0,
++                                bytes_per_row: Some(dest_bytes_per_row),
++                                rows_per_image: Some(rows_per_image),
++                            },
+                         },
+-                    },
+-                    wgpu::TexelCopyTextureInfo {
+-                        texture: &dest.texture,
+-                        mip_level: 0,
+-                        origin: wgpu::Origin3d {
+-                            x: 0,
+-                            y: 0,
+-                            z: layer,
++                        wgpu::TexelCopyTextureInfo {
++                            texture: &dest.texture,
++                            mip_level: 0,
++                            origin: wgpu::Origin3d {
++                                x: 0,
++                                y: 0,
++                                z: layer,
++                            },
++                            aspect: wgpu::TextureAspect::All,
+                         },
+-                        aspect: wgpu::TextureAspect::All,
+-                    },
+-                    // The copy size uses the original image, with the original row size
+-                    wgpu::Extent3d {
+-                        width: source_width,
+-                        height: source_height,
+-                        depth_or_array_layers: 1,
+-                    },
+-                );
++                        // The copy size uses the original image, with the original row size
++                        wgpu::Extent3d {
++                            width: source_width,
++                            height: source_height,
++                            depth_or_array_layers: 1,
++                        },
++                    );
+             }
+             Context3DCommand::SetTextureAt {
+                 sampler,
+@@ -1114,6 +1405,10 @@ impl Context3D for WgpuContext3D {
+                 dest,
+                 layer,
+             } => {
++                self.end_pending_pass_if_uses(
++                    Rc::as_ptr(&dest) as *const () as usize,
++                    crate::pmstat::C::BreakTexture,
++                );
+                 let dest = Rc::<dyn Any>::downcast::<TextureWrapper>(dest).unwrap();
+                 if dest.disposed.get() {
+                     return;
+@@ -1138,9 +1433,16 @@ impl Context3D for WgpuContext3D {
+                             depth_or_array_layers: 1,
+                         },
+                     );
+-                // Submit now, so the copy sees the bitmap as it is at this point (the main
+-                // renderer may draw into it again before our next present).
+-                self.flush();
++                // The copy must see the bitmap as it is at this point (the main renderer may
++                // draw into it again before our next present). `RUFFLE_S3D_DEFER_UPLOAD`: the
++                // renderer queued its pending work (`flush_pending_gpu_work`), we queue ours
++                // with the copy right after it, and the next submit, whoever makes it, runs
++                // both before anything recorded later. Otherwise submit now.
++                if crate::descriptors::s3d_defer_upload() {
++                    self.defer();
++                } else {
++                    self.flush();
++                }
+             }
+             Context3DCommand::DisposeTexture { texture } => {
+                 let wrapper = <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
+@@ -1280,6 +1582,7 @@ impl Context3D for WgpuContext3D {
+ 
+     #[instrument(level = "debug", skip_all)]
+     fn present(&mut self) {
++        crate::pmstat::add(crate::pmstat::C::Present, 1);
+         self.flush();
+         std::mem::swap(
+             &mut self.back_buffer_raw_texture_handle,
+@@ -1359,3 +1662,130 @@ fn frame_encoder<'a>(
+ ) -> &'a mut CommandEncoder {
+     slot.get_or_insert_with(|| new_frame_encoder(device))
+ }
++
++/// PortMaster port: `RUFFLE_S3D_MERGE_PASSES` (default on, "0" turns it off). Consecutive
++/// `drawTriangles` calls on the same target share one render pass (`PendingPass`) instead of
++/// one pass each; on GLES every pass rebinds the framebuffer, and tiled GPUs (Mali) then store
++/// and reload the whole target between draws. Program constants go through a uniform ring with
++/// dynamic offsets, so a constant change between draws needs no copy inside the pass.
++pub(crate) fn s3d_merge_passes() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("RUFFLE_S3D_MERGE_PASSES").map_or(true, |v| v != "0"))
++}
++
++/// PortMaster port (`RUFFLE_S3D_MERGE_PASSES`): draws on one target, recorded as one render pass
++/// when something needs them in order: a change of target, a clear, `present`, or an upload into
++/// a buffer or texture they use (`uses`; uploads into anything else are recorded right away,
++/// before the pass, which they do not affect).
++struct PendingPass {
++    color_view: wgpu::TextureView,
++    resolve_view: Option<wgpu::TextureView>,
++    depth_view: Option<wgpu::TextureView>,
++    color_load: wgpu::LoadOp<wgpu::Color>,
++    depth_load: wgpu::LoadOp<f32>,
++    stencil_load: wgpu::LoadOp<u32>,
++    size: Extent3d,
++    /// Address of the target texture (`None`: the back buffer)
++    target: Option<usize>,
++    draws: Vec<PendingDraw>,
++    /// Addresses of the vertex and index buffer wrappers and textures the draws use
++    uses: Vec<usize>,
++    /// Ring offset of `uniforms`: the program constants the draws use, copied into the ring
++    /// before the pass
++    uniform_base: u64,
++    uniforms: Vec<u8>,
++}
++
++struct PendingDraw {
++    /// `false`: `drawTriangles` without its required textures (the pass still clears)
++    draw: bool,
++    pipeline: Option<wgpu::RenderPipeline>,
++    bind_group: Option<BindGroup>,
++    /// Vertex and fragment constants in the uniform ring
++    offsets: [u32; 2],
++    vertex_buffers: Vec<wgpu::Buffer>,
++    index_buffer: wgpu::Buffer,
++    indices: std::ops::Range<u32>,
++    scissor: Option<[u32; 4]>,
++    stencil_ref: u32,
++}
++
++fn encode_pending_pass(encoder: &mut CommandEncoder, pass: &PendingPass) {
++    crate::pmstat::add(crate::pmstat::C::Pass, 1);
++    let depth_stencil_attachment =
++        pass.depth_view
++            .as_ref()
++            .map(|view| wgpu::RenderPassDepthStencilAttachment {
++                view,
++                depth_ops: Some(wgpu::Operations {
++                    load: pass.depth_load,
++                    store: wgpu::StoreOp::Store,
++                }),
++                stencil_ops: Some(wgpu::Operations {
++                    load: pass.stencil_load,
++                    store: wgpu::StoreOp::Store,
++                }),
++            });
++    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++        label: Some("Context3D render pass"),
++        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++            view: &pass.color_view,
++            resolve_target: pass.resolve_view.as_ref(),
++            ops: wgpu::Operations {
++                load: pass.color_load,
++                store: wgpu::StoreOp::Store,
++            },
++            depth_slice: None,
++        })],
++        depth_stencil_attachment,
++        ..Default::default()
++    });
++    // Only state that changes between draws is set again.
++    let mut pipeline: Option<&wgpu::RenderPipeline> = None;
++    let mut bind_group: Option<(&BindGroup, [u32; 2])> = None;
++    let mut vertex_buffers: Vec<&wgpu::Buffer> = Vec::new();
++    let mut index_buffer: Option<&wgpu::Buffer> = None;
++    // A new pass starts with the whole target as scissor rectangle and reference 0.
++    let mut scissor: Option<[u32; 4]> = None;
++    let mut stencil_ref: Option<u32> = None;
++    for draw in pass.draws.iter().filter(|draw| draw.draw) {
++        let (Some(draw_pipeline), Some(draw_bind_group)) = (&draw.pipeline, &draw.bind_group)
++        else {
++            continue;
++        };
++        if pipeline != Some(draw_pipeline) {
++            render_pass.set_pipeline(draw_pipeline);
++            pipeline = Some(draw_pipeline);
++        }
++        if bind_group != Some((draw_bind_group, draw.offsets)) {
++            render_pass.set_bind_group(0, draw_bind_group, &draw.offsets);
++            bind_group = Some((draw_bind_group, draw.offsets));
++        }
++        for (i, buffer) in draw.vertex_buffers.iter().enumerate() {
++            if vertex_buffers.get(i) != Some(&buffer) {
++                render_pass.set_vertex_buffer(i as u32, buffer.slice(..));
++                if i < vertex_buffers.len() {
++                    vertex_buffers[i] = buffer;
++                } else {
++                    vertex_buffers.push(buffer);
++                }
++            }
++        }
++        if index_buffer != Some(&draw.index_buffer) {
++            render_pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
++            index_buffer = Some(&draw.index_buffer);
++        }
++        if scissor != draw.scissor {
++            let [x, y, width, height] =
++                draw.scissor
++                    .unwrap_or([0, 0, pass.size.width, pass.size.height]);
++            render_pass.set_scissor_rect(x, y, width, height);
++            scissor = draw.scissor;
++        }
++        if stencil_ref != Some(draw.stencil_ref) {
++            render_pass.set_stencil_reference(draw.stencil_ref);
++            stencil_ref = Some(draw.stencil_ref);
++        }
++        render_pass.draw_indexed(draw.indices.clone(), 0, 0..1);
++    }
++}
+diff --git a/render/wgpu/src/context3d/shader_pair.rs b/render/wgpu/src/context3d/shader_pair.rs
+index 3e543ec4..039c4341 100644
+--- a/render/wgpu/src/context3d/shader_pair.rs
++++ b/render/wgpu/src/context3d/shader_pair.rs
+@@ -85,7 +85,7 @@ impl ShaderPairAgal {
+                         visibility: wgpu::ShaderStages::VERTEX,
+                         ty: wgpu::BindingType::Buffer {
+                             ty: wgpu::BufferBindingType::Uniform,
+-                            has_dynamic_offset: false,
++                            has_dynamic_offset: super::s3d_merge_passes(),
+                             min_binding_size: None,
+                         },
+                         count: None,
+@@ -96,7 +96,7 @@ impl ShaderPairAgal {
+                         visibility: wgpu::ShaderStages::FRAGMENT,
+                         ty: wgpu::BindingType::Buffer {
+                             ty: wgpu::BufferBindingType::Uniform,
+-                            has_dynamic_offset: false,
++                            has_dynamic_offset: super::s3d_merge_passes(),
+                             min_binding_size: None,
+                         },
+                         count: None,
+diff --git a/render/wgpu/src/descriptors.rs b/render/wgpu/src/descriptors.rs
+index e12f4bbd..2c4d37a9 100644
+--- a/render/wgpu/src/descriptors.rs
++++ b/render/wgpu/src/descriptors.rs
+@@ -10,6 +10,14 @@ use std::fmt::Debug;
+ use std::sync::{Arc, Mutex};
+ use wgpu::Backend;
+ 
++/// PortMaster port: `RUFFLE_S3D_DEFER_UPLOAD` (default on, "0" turns it off). A GPU-side
++/// `Texture.uploadFromBitmapData` queues the pending renderer and Stage3D work (see
++/// `Descriptors::deferred_command_buffers`) instead of submitting both right away.
++pub fn s3d_defer_upload() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("RUFFLE_S3D_DEFER_UPLOAD").map_or(true, |v| v != "0"))
++}
++
+ pub struct Descriptors {
+     pub wgpu_instance: wgpu::Instance,
+     pub adapter: wgpu::Adapter,
+@@ -24,6 +32,12 @@ pub struct Descriptors {
+     pub shaders: Shaders,
+     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
+     pub filters: Filters,
++    /// PortMaster port (`RUFFLE_S3D_DEFER_UPLOAD`): finished command buffers waiting for the next
++    /// queue submit, in the order they must run. The renderer and Stage3D record into separate
++    /// encoders; instead of submitting both at every `Texture.uploadFromBitmapData` (two GL
++    /// replays plus a glFlush each on GLES), they are queued here and every submit takes them
++    /// first, so they still run in recording order.
++    pub deferred_command_buffers: Mutex<Vec<wgpu::CommandBuffer>>,
+ }
+ 
+ impl Debug for Descriptors {
+@@ -61,9 +75,30 @@ impl Descriptors {
+             shaders,
+             pipelines: Default::default(),
+             filters,
++            deferred_command_buffers: Default::default(),
+         }
+     }
+ 
++    /// PortMaster port: queue a finished command buffer for the next submit (see
++    /// `deferred_command_buffers`).
++    pub fn defer_command_buffer(&self, buffer: wgpu::CommandBuffer) {
++        crate::pmstat::add(crate::pmstat::C::Deferred, 1);
++        self.deferred_command_buffers
++            .lock()
++            .expect("deferred command buffers")
++            .push(buffer);
++    }
++
++    /// PortMaster port: the queued command buffers, to go first in a submit.
++    pub fn take_deferred_command_buffers(&self) -> Vec<wgpu::CommandBuffer> {
++        std::mem::take(
++            &mut *self
++                .deferred_command_buffers
++                .lock()
++                .expect("deferred command buffers"),
++        )
++    }
++
+     pub fn copy_pipeline(
+         &self,
+         format: wgpu::TextureFormat,
+diff --git a/render/wgpu/src/lib.rs b/render/wgpu/src/lib.rs
+index 3dca74e9..40928520 100644
+--- a/render/wgpu/src/lib.rs
++++ b/render/wgpu/src/lib.rs
+@@ -33,6 +33,7 @@ mod bitmaps;
+ mod context3d;
+ mod globals;
+ mod pipelines;
++mod pmstat;
+ mod pixel_bender;
+ pub mod target;
+ 
+diff --git a/render/wgpu/src/pmstat.rs b/render/wgpu/src/pmstat.rs
+new file mode 100644
+index 00000000..6477a2e5
+--- /dev/null
++++ b/render/wgpu/src/pmstat.rs
+@@ -0,0 +1,72 @@
++//! PortMaster port: queue submits and Stage3D render pass counters. With `PM_GPUSTAT` set they
++//! are logged every 2 s (target `pmgpu`, next to the upload / offscreen / readback line).
++
++use std::cell::RefCell;
++use std::sync::OnceLock;
++use std::time::{Duration, Instant};
++
++#[derive(Clone, Copy)]
++pub enum C {
++    /// `queue.submit` calls (renderer and Stage3D)
++    Submit,
++    /// Command buffers passed to those submits
++    SubmitBuffers,
++    /// Command buffers queued for a later submit instead of submitted
++    Deferred,
++    /// `Context3D.present` calls
++    Present,
++    /// Stage3D render passes begun
++    Pass,
++    /// Stage3D draws recorded
++    Draw,
++    /// Stage3D pass ended early because a buffer used by the pass was uploaded to
++    BreakBuffer,
++    /// ... because a texture was copied into
++    BreakTexture,
++    /// ... because the uniform ring was full
++    BreakRing,
++}
++
++const N: usize = 9;
++const NAMES: [&str; N] = [
++    "submits",
++    "buffers",
++    "deferred",
++    "presents",
++    "s3d passes",
++    "s3d draws",
++    "breaks buffer",
++    "texture",
++    "ring",
++];
++
++thread_local! {
++    static S: RefCell<(Instant, [u64; N])> = RefCell::new((Instant::now(), [0; N]));
++}
++
++pub fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("PM_GPUSTAT").is_some())
++}
++
++pub fn add(c: C, n: u64) {
++    if !on() {
++        return;
++    }
++    S.with(|s| {
++        let mut s = s.borrow_mut();
++        s.1[c as usize] += n;
++        if s.0.elapsed() >= Duration::from_secs(2) {
++            let mut line = String::new();
++            for (i, name) in NAMES.iter().enumerate() {
++                if !line.is_empty() {
++                    line.push_str(", ");
++                }
++                line.push_str(&format!("{name} {}", s.1[i]));
++            }
++            tracing::info!(target: "pmgpu", "per 2s: {line}");
++            s.0 = Instant::now();
++            s.1 = [0; N];
++        }
++    });
++}

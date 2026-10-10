@@ -1,0 +1,1145 @@
+From 6f9b889dae6937ce16b08f902ad60865accc3f4d Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 08:46:21 -0400
+Subject: [PATCH 06/14] ruffle_sdl: Ruffle on SDL2 and GLES 3 for handhelds
+
+A small front end (new crate sdl/, binary ruffle_sdl) for Linux handhelds
+that have SDL2 and a GLES driver but no X11 or Wayland session. It replaces
+Westonpack plus desktop Ruffle for the Fancy Pants Adventures port.
+
+* Video: SDL opens a fullscreen window with a GLES 3.0 context. wgpu runs on
+  that context through wgpu-hal external GLES adapter (no wgpu backend of its
+  own: a second EGL display and context cost about 80 MB with Mesa). Ruffle
+  draws each frame into one texture, which is blitted (Y flipped, scaled to
+  fit) to the window. Debug labels are discarded, because Mali blob drivers
+  crash in glPushDebugGroup (gfx-rs/wgpu#8937). --gl-finish replaces fence
+  waits by glFinish for drivers with a broken glClientWaitSync; --render-size
+  draws at a smaller size and scales up.
+* Input: SDL keyboard, text and mouse events (on handhelds these come from
+  gptokeyb virtual devices).
+* Audio: Ruffle mixer through SDL audio (the output the firmware is set up
+  for); cpal/ALSA as the fallback, then no audio.
+* Loading: files only, through core NullNavigatorBackend relative to the SWF
+  folder, with its executor polled in the main loop (so the Classic Pack shell
+  can load its worlds, with no reqwest, tokio or OpenSSL in the binary).
+* fscommand: "quit" ends the loop; "relaunch <args>" prints
+  "FPA_RELAUNCH <args>" and quits, so the port launch script can start Ruffle
+  again straight into the next world (one world in memory at a time).
+* Stage: --stage-scale fit (default) centres and scales the stage to fit
+  whatever the movie asks for; --stage-scale movie keeps the movie own scale
+  mode and alignment without letterbox (the Classic Pack shell lays itself out
+  for 3:2 and 4:3 screens).
+* Memory, for 1 GB devices: 1% extra collector work per tick
+  (Player::add_gc_work, RUFFLE_GC_STEP), malloc_trim every 2 s
+  (RUFFLE_TRIM_SECS), and one full collection plus a trim after a tick longer
+  than 1 s, which is a load (RUFFLE_GC_LONG_TICK). glibc otherwise keeps the
+  memory a load freed.
+* RUFFLE_SDL_TIMING=1 logs the share of time spent in tick, render and swap
+  every 2 s; long ticks are logged at info level.
+
+request_device in ruffle_render_wgpu becomes public, so a front end with its
+own adapter can ask for a device with Ruffle limits and features.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                 |  50 +++
+ Cargo.toml                 |   1 +
+ render/wgpu/src/backend.rs |   2 +-
+ sdl/Cargo.toml             |  31 ++
+ sdl/src/audio.rs           |  55 ++++
+ sdl/src/keys.rs            | 219 ++++++++++++
+ sdl/src/main.rs            | 659 +++++++++++++++++++++++++++++++++++++
+ 7 files changed, 1016 insertions(+), 1 deletion(-)
+ create mode 100644 sdl/Cargo.toml
+ create mode 100644 sdl/src/audio.rs
+ create mode 100644 sdl/src/keys.rs
+ create mode 100644 sdl/src/main.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 9029daad..44b31d93 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5161,6 +5161,27 @@ dependencies = [
+  "walkdir",
+ ]
+ 
++[[package]]
++name = "ruffle_sdl"
++version = "0.7.0-nightly.2026.10.4"
++dependencies = [
++ "anyhow",
++ "clap",
++ "futures",
++ "glow",
++ "ruffle_core",
++ "ruffle_frontend_utils",
++ "ruffle_render",
++ "ruffle_render_wgpu",
++ "ruffle_video_software",
++ "sdl2",
++ "tracing",
++ "tracing-subscriber",
++ "url",
++ "wgpu",
++ "wgpu-hal",
++]
++
+ [[package]]
+ name = "ruffle_socket_format"
+ version = "0.7.0-nightly.2026.10.4"
+@@ -5525,6 +5546,29 @@ dependencies = [
+  "tiny-skia",
+ ]
+ 
++[[package]]
++name = "sdl2"
++version = "0.37.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3b498da7d14d1ad6c839729bd4ad6fc11d90a57583605f3b4df2cd709a9cd380"
++dependencies = [
++ "bitflags 1.3.2",
++ "lazy_static",
++ "libc",
++ "sdl2-sys",
++]
++
++[[package]]
++name = "sdl2-sys"
++version = "0.37.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "951deab27af08ed9c6068b7b0d05a93c91f0a8eb16b6b816a5e73452a43521d3"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "version-compare",
++]
++
+ [[package]]
+ name = "security-framework"
+ version = "3.7.0"
+@@ -6775,6 +6819,12 @@ dependencies = [
+  "rustversion",
+ ]
+ 
++[[package]]
++name = "version-compare"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "579a42fc0b8e0c63b76519a339be31bed574929511fa53c1a3acae26eb258f29"
++
+ [[package]]
+ name = "version_check"
+ version = "0.9.5"
+diff --git a/Cargo.toml b/Cargo.toml
+index 446b06e1..a3ad3398 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4,6 +4,7 @@ members = [
+     "core/macros",
+     "core/build_playerglobal",
+     "desktop",
++    "sdl",
+     "swf",
+     "flv",
+     "web",
+diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
+index b450481d..80cc84d7 100644
+--- a/render/wgpu/src/backend.rs
++++ b/render/wgpu/src/backend.rs
+@@ -1213,7 +1213,7 @@ pub async fn request_adapter_and_device(
+ }
+ 
+ // We try to request the highest limits we can get away with
+-async fn request_device(
++pub async fn request_device(
+     adapter: &wgpu::Adapter,
+ ) -> Result<(wgpu::Device, wgpu::Queue), wgpu::RequestDeviceError> {
+     // We start off with the lowest limits we actually need - basically GL-ES 3.0
+diff --git a/sdl/Cargo.toml b/sdl/Cargo.toml
+new file mode 100644
+index 00000000..7d7f8982
+--- /dev/null
++++ b/sdl/Cargo.toml
+@@ -0,0 +1,31 @@
++[package]
++name = "ruffle_sdl"
++description = "Ruffle on SDL2 + GLES 3 for handhelds without X11/Wayland (PortMaster)"
++edition.workspace = true
++homepage.workspace = true
++license.workspace = true
++repository.workspace = true
++version.workspace = true
++
++[lints]
++workspace = true
++
++[dependencies]
++clap = { workspace = true }
++ruffle_core = { path = "../core", features = ["audio", "clap", "mp3", "aac", "nellymoser", "default_compatibility_rules", "default_font"] }
++ruffle_render = { path = "../render", features = ["clap"] }
++ruffle_render_wgpu = { path = "../render/wgpu" }
++ruffle_video_software = { path = "../video/software" }
++ruffle_frontend_utils = { path = "../frontend-utils", default-features = false, features = ["cpal", "fs"] }
++wgpu = { workspace = true }
++wgpu-hal = { version = "30.0.1", features = ["gles"] }
++glow = "0.17"
++sdl2 = "0.37"
++tracing = { workspace = true }
++tracing-subscriber = { workspace = true }
++anyhow = { workspace = true }
++futures = { workspace = true }
++url = { workspace = true }
++
++[features]
++lzma = ["ruffle_core/lzma"]
+diff --git a/sdl/src/audio.rs b/sdl/src/audio.rs
+new file mode 100644
+index 00000000..aabc0a2b
+--- /dev/null
++++ b/sdl/src/audio.rs
+@@ -0,0 +1,55 @@
++//! Audio through the firmware's SDL2 (the path every PortMaster port uses), mixed by Ruffle.
++
++use ruffle_core::backend::audio::{
++    AudioBackend, AudioMixer, AudioMixerProxy, DecodeError, RegisterError, SoundHandle,
++    SoundInstanceHandle, SoundStreamInfo, SoundTransform, swf,
++};
++use ruffle_core::impl_audio_mixer_backend;
++use sdl2::audio::{AudioCallback, AudioDevice, AudioSpecDesired};
++
++pub struct Mix(AudioMixerProxy);
++
++impl AudioCallback for Mix {
++    type Channel = i16;
++
++    fn callback(&mut self, out: &mut [i16]) {
++        self.0.mix::<i16>(out);
++    }
++}
++
++pub struct SdlAudioBackend {
++    device: AudioDevice<Mix>,
++    mixer: AudioMixer,
++}
++
++impl SdlAudioBackend {
++    pub fn new(audio: &sdl2::AudioSubsystem) -> Result<Self, String> {
++        let desired = AudioSpecDesired {
++            freq: Some(44100),
++            channels: Some(2),
++            samples: Some(1024),
++        };
++        let mut mixer = None;
++        let device = audio.open_playback(None, &desired, |spec| {
++            let m = AudioMixer::new(spec.channels, spec.freq as u32);
++            let mix = Mix(m.proxy());
++            mixer = Some(m);
++            mix
++        })?;
++        device.resume();
++        let mixer = mixer.ok_or("no audio mixer")?;
++        Ok(Self { device, mixer })
++    }
++}
++
++impl AudioBackend for SdlAudioBackend {
++    impl_audio_mixer_backend!(mixer);
++
++    fn play(&mut self) {
++        self.device.resume();
++    }
++
++    fn pause(&mut self) {
++        self.device.pause();
++    }
++}
+diff --git a/sdl/src/keys.rs b/sdl/src/keys.rs
+new file mode 100644
+index 00000000..3bf0f839
+--- /dev/null
++++ b/sdl/src/keys.rs
+@@ -0,0 +1,219 @@
++//! SDL keyboard events to Ruffle key descriptors.
++
++use ruffle_core::events::{KeyDescriptor, KeyLocation, LogicalKey, NamedKey, PhysicalKey};
++use sdl2::keyboard::{Keycode, Mod, Scancode};
++
++pub fn key_descriptor(
++    scancode: Option<Scancode>,
++    keycode: Option<Keycode>,
++    keymod: Mod,
++) -> KeyDescriptor {
++    let physical_key = scancode.map(physical).unwrap_or(PhysicalKey::Unknown);
++    KeyDescriptor {
++        physical_key,
++        logical_key: keycode
++            .map(|k| logical(k, keymod))
++            .unwrap_or(LogicalKey::Unknown),
++        key_location: location(physical_key),
++    }
++}
++
++fn location(key: PhysicalKey) -> KeyLocation {
++    use PhysicalKey as P;
++    match key {
++        P::ShiftLeft | P::ControlLeft | P::AltLeft | P::SuperLeft => KeyLocation::Left,
++        P::ShiftRight | P::ControlRight | P::AltRight | P::SuperRight => KeyLocation::Right,
++        P::NumLock
++        | P::NumpadDivide
++        | P::NumpadMultiply
++        | P::NumpadSubtract
++        | P::NumpadAdd
++        | P::NumpadEnter
++        | P::NumpadDecimal
++        | P::NumpadComma
++        | P::Numpad0
++        | P::Numpad1
++        | P::Numpad2
++        | P::Numpad3
++        | P::Numpad4
++        | P::Numpad5
++        | P::Numpad6
++        | P::Numpad7
++        | P::Numpad8
++        | P::Numpad9 => KeyLocation::Numpad,
++        _ => KeyLocation::Standard,
++    }
++}
++
++fn logical(keycode: Keycode, keymod: Mod) -> LogicalKey {
++    use NamedKey as N;
++    let named = match keycode {
++        Keycode::LALT | Keycode::RALT => N::Alt,
++        Keycode::LCTRL | Keycode::RCTRL => N::Control,
++        Keycode::LSHIFT | Keycode::RSHIFT => N::Shift,
++        Keycode::LGUI | Keycode::RGUI => N::Super,
++        Keycode::CAPSLOCK => N::CapsLock,
++        Keycode::NUMLOCKCLEAR => N::NumLock,
++        Keycode::SCROLLLOCK => N::ScrollLock,
++        Keycode::RETURN | Keycode::KP_ENTER => N::Enter,
++        Keycode::TAB => N::Tab,
++        Keycode::DOWN => N::ArrowDown,
++        Keycode::LEFT => N::ArrowLeft,
++        Keycode::RIGHT => N::ArrowRight,
++        Keycode::UP => N::ArrowUp,
++        Keycode::END => N::End,
++        Keycode::HOME => N::Home,
++        Keycode::PAGEDOWN => N::PageDown,
++        Keycode::PAGEUP => N::PageUp,
++        Keycode::BACKSPACE => N::Backspace,
++        Keycode::DELETE => N::Delete,
++        Keycode::INSERT => N::Insert,
++        Keycode::ESCAPE => N::Escape,
++        Keycode::PAUSE => N::Pause,
++        Keycode::PRINTSCREEN => N::PrintScreen,
++        Keycode::APPLICATION => N::ContextMenu,
++        Keycode::F1 => N::F1,
++        Keycode::F2 => N::F2,
++        Keycode::F3 => N::F3,
++        Keycode::F4 => N::F4,
++        Keycode::F5 => N::F5,
++        Keycode::F6 => N::F6,
++        Keycode::F7 => N::F7,
++        Keycode::F8 => N::F8,
++        Keycode::F9 => N::F9,
++        Keycode::F10 => N::F10,
++        Keycode::F11 => N::F11,
++        Keycode::F12 => N::F12,
++        _ => {
++            // Printable keys: SDL keycodes are the unshifted character.
++            let code = keycode.into_i32();
++            return match char::from_u32(code as u32) {
++                Some(c) if (' '..='~').contains(&c) => {
++                    let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
++                    let caps = keymod.contains(Mod::CAPSMOD);
++                    LogicalKey::Character(if c.is_ascii_alphabetic() && (shift ^ caps) {
++                        c.to_ascii_uppercase()
++                    } else {
++                        c
++                    })
++                }
++                _ => LogicalKey::Unknown,
++            };
++        }
++    };
++    LogicalKey::Named(named)
++}
++
++fn physical(scancode: Scancode) -> PhysicalKey {
++    use PhysicalKey as P;
++    use Scancode as S;
++    match scancode {
++        S::Grave => P::Backquote,
++        S::Num0 => P::Digit0,
++        S::Num1 => P::Digit1,
++        S::Num2 => P::Digit2,
++        S::Num3 => P::Digit3,
++        S::Num4 => P::Digit4,
++        S::Num5 => P::Digit5,
++        S::Num6 => P::Digit6,
++        S::Num7 => P::Digit7,
++        S::Num8 => P::Digit8,
++        S::Num9 => P::Digit9,
++        S::Minus => P::Minus,
++        S::Equals => P::Equal,
++        S::A => P::KeyA,
++        S::B => P::KeyB,
++        S::C => P::KeyC,
++        S::D => P::KeyD,
++        S::E => P::KeyE,
++        S::F => P::KeyF,
++        S::G => P::KeyG,
++        S::H => P::KeyH,
++        S::I => P::KeyI,
++        S::J => P::KeyJ,
++        S::K => P::KeyK,
++        S::L => P::KeyL,
++        S::M => P::KeyM,
++        S::N => P::KeyN,
++        S::O => P::KeyO,
++        S::P => P::KeyP,
++        S::Q => P::KeyQ,
++        S::R => P::KeyR,
++        S::S => P::KeyS,
++        S::T => P::KeyT,
++        S::U => P::KeyU,
++        S::V => P::KeyV,
++        S::W => P::KeyW,
++        S::X => P::KeyX,
++        S::Y => P::KeyY,
++        S::Z => P::KeyZ,
++        S::LeftBracket => P::BracketLeft,
++        S::RightBracket => P::BracketRight,
++        S::Backslash => P::Backslash,
++        S::Semicolon => P::Semicolon,
++        S::Apostrophe => P::Quote,
++        S::NonUsBackslash => P::IntlBackslash,
++        S::Comma => P::Comma,
++        S::Period => P::Period,
++        S::Slash => P::Slash,
++        S::Backspace => P::Backspace,
++        S::Tab => P::Tab,
++        S::CapsLock => P::CapsLock,
++        S::Return => P::Enter,
++        S::LShift => P::ShiftLeft,
++        S::RShift => P::ShiftRight,
++        S::LCtrl => P::ControlLeft,
++        S::RCtrl => P::ControlRight,
++        S::LGui => P::SuperLeft,
++        S::RGui => P::SuperRight,
++        S::LAlt => P::AltLeft,
++        S::RAlt => P::AltRight,
++        S::Space => P::Space,
++        S::Application => P::ContextMenu,
++        S::Insert => P::Insert,
++        S::Delete => P::Delete,
++        S::Home => P::Home,
++        S::End => P::End,
++        S::PageUp => P::PageUp,
++        S::PageDown => P::PageDown,
++        S::Up => P::ArrowUp,
++        S::Left => P::ArrowLeft,
++        S::Down => P::ArrowDown,
++        S::Right => P::ArrowRight,
++        S::NumLockClear => P::NumLock,
++        S::KpDivide => P::NumpadDivide,
++        S::KpMultiply => P::NumpadMultiply,
++        S::KpMinus => P::NumpadSubtract,
++        S::KpPlus => P::NumpadAdd,
++        S::KpEnter => P::NumpadEnter,
++        S::KpPeriod => P::NumpadDecimal,
++        S::KpComma => P::NumpadComma,
++        S::Kp0 => P::Numpad0,
++        S::Kp1 => P::Numpad1,
++        S::Kp2 => P::Numpad2,
++        S::Kp3 => P::Numpad3,
++        S::Kp4 => P::Numpad4,
++        S::Kp5 => P::Numpad5,
++        S::Kp6 => P::Numpad6,
++        S::Kp7 => P::Numpad7,
++        S::Kp8 => P::Numpad8,
++        S::Kp9 => P::Numpad9,
++        S::Escape => P::Escape,
++        S::F1 => P::F1,
++        S::F2 => P::F2,
++        S::F3 => P::F3,
++        S::F4 => P::F4,
++        S::F5 => P::F5,
++        S::F6 => P::F6,
++        S::F7 => P::F7,
++        S::F8 => P::F8,
++        S::F9 => P::F9,
++        S::F10 => P::F10,
++        S::F11 => P::F11,
++        S::F12 => P::F12,
++        S::PrintScreen => P::PrintScreen,
++        S::ScrollLock => P::ScrollLock,
++        S::Pause => P::Pause,
++        _ => P::Unknown,
++    }
++}
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+new file mode 100644
+index 00000000..5ac9cc38
+--- /dev/null
++++ b/sdl/src/main.rs
+@@ -0,0 +1,659 @@
++//! Ruffle on the firmware's SDL2, for handhelds without X11 or Wayland (PortMaster).
++//!
++//! SDL opens the window and a GLES 3.0 context; wgpu runs on that context through wgpu-hal's
++//! external GLES adapter. Ruffle draws each frame into one texture, which is blitted (Y flipped)
++//! to the window. Input is SDL's keyboard and mouse (on handhelds: gptokeyb's virtual devices).
++//! Everything runs on the main thread, as GL needs with an external context.
++
++mod audio;
++mod keys;
++
++use anyhow::{Context as _, anyhow};
++use clap::Parser;
++use glow::HasContext;
++use ruffle_core::backend::audio::NullAudioBackend;
++use ruffle_core::backend::navigator::{NullExecutor, NullNavigatorBackend};
++use ruffle_core::backend::ui::NullUiBackend;
++use ruffle_core::config::Letterbox;
++use ruffle_core::events::{MouseButton, MouseWheelDelta, PlayerEvent};
++use ruffle_core::external::FsCommandProvider;
++use ruffle_core::tag_utils::SwfMovie;
++use ruffle_core::{FloatDuration, PlayerBuilder, PlayerRuntime, StageAlign, StageScaleMode};
++use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
++use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
++use ruffle_render::quality::StageQuality;
++use ruffle_render_wgpu::backend::{WgpuRenderBackend, request_device};
++use ruffle_render_wgpu::descriptors::Descriptors;
++use ruffle_render_wgpu::target::{RenderTarget, RenderTargetFrame};
++use sdl2::event::{Event, WindowEvent};
++use sdl2::mouse::MouseButton as SdlMouseButton;
++use std::cell::Cell;
++use std::path::PathBuf;
++use std::rc::Rc;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++#[derive(Parser, Debug)]
++#[clap(name = "ruffle_sdl", version)]
++struct Opt {
++    /// Path of the SWF to play
++    swf: PathBuf,
++
++    /// Window size (default: the whole screen)
++    #[clap(long)]
++    width: Option<u32>,
++    #[clap(long)]
++    height: Option<u32>,
++
++    /// Stage quality
++    #[clap(long, short, default_value = "low")]
++    quality: StageQuality,
++
++    /// Emulated runtime
++    #[clap(long, default_value = "air")]
++    player_runtime: PlayerRuntime,
++
++    /// Where shared objects are saved
++    #[clap(long)]
++    save_directory: PathBuf,
++
++    /// flashvars, as -Pkey=value (repeatable)
++    #[clap(short = 'P', value_parser(parse_parameter))]
++    parameters: Vec<(String, String)>,
++
++    /// Draw the movie at this size and scale it to the screen (e.g. 640x480);
++    /// default: draw at screen size
++    #[clap(long, value_parser(parse_size))]
++    render_size: Option<(u32, u32)>,
++
++    /// Replace GL fence waits by glFinish (for drivers with broken glClientWaitSync)
++    #[clap(long)]
++    gl_finish: bool,
++
++    /// Stage scaling: "fit" = centred and scaled to fit whatever the movie asks for, with
++    /// letterbox bars; "movie" = the movie's own scale mode and alignment, no letterbox
++    #[clap(long, default_value = "fit", value_parser(["fit", "movie"]))]
++    stage_scale: String,
++}
++
++fn parse_parameter(s: &str) -> Result<(String, String), String> {
++    let (k, v) = s.split_once('=').unwrap_or((s, ""));
++    Ok((k.to_string(), v.to_string()))
++}
++
++fn parse_size(s: &str) -> Result<(u32, u32), String> {
++    let (w, h) = s.split_once('x').ok_or("expected WIDTHxHEIGHT")?;
++    Ok((
++        w.parse().map_err(|_| "bad width")?,
++        h.parse().map_err(|_| "bad height")?,
++    ))
++}
++
++/// The movie is drawn into `texture`; `submit` blits it to the window's framebuffer.
++struct SdlTarget {
++    gl: Rc<glow::Context>,
++    texture: wgpu::Texture,
++    width: u32,
++    height: u32,
++    /// Window size, the blit's destination
++    screen: Rc<Cell<(u32, u32)>>,
++    read_fbo: Cell<Option<(glow::Framebuffer, glow::Texture)>>,
++}
++
++impl std::fmt::Debug for SdlTarget {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "SdlTarget({}x{})", self.width, self.height)
++    }
++}
++
++#[derive(Debug)]
++struct SdlFrame(wgpu::TextureView);
++
++impl RenderTargetFrame for SdlFrame {
++    fn into_view(self) -> wgpu::TextureView {
++        self.0
++    }
++
++    fn view(&self) -> &wgpu::TextureView {
++        &self.0
++    }
++}
++
++const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
++
++fn create_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
++    device.create_texture(&wgpu::TextureDescriptor {
++        label: Some("ruffle_sdl movie"),
++        size: wgpu::Extent3d {
++            width,
++            height,
++            depth_or_array_layers: 1,
++        },
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: FORMAT,
++        // TEXTURE_BINDING keeps it a GL texture (not a renderbuffer), so it can go on our FBO
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
++            | wgpu::TextureUsages::TEXTURE_BINDING
++            | wgpu::TextureUsages::COPY_SRC,
++        view_formats: &[],
++    })
++}
++
++impl SdlTarget {
++    fn gl_texture(&self) -> Option<glow::Texture> {
++        let hal = unsafe { self.texture.as_hal::<wgpu_hal::api::Gles>() }?;
++        match hal.inner {
++            wgpu_hal::gles::TextureInner::Texture { raw, .. } => Some(raw),
++            _ => None,
++        }
++    }
++
++    fn blit(&self) {
++        let Some(texture) = self.gl_texture() else {
++            tracing::error!("movie texture is not a GL texture");
++            return;
++        };
++        let gl = &self.gl;
++        unsafe {
++            let fbo = match self.read_fbo.get() {
++                Some((fbo, tex)) if tex == texture => fbo,
++                old => {
++                    if let Some((fbo, _)) = old {
++                        gl.delete_framebuffer(fbo);
++                    }
++                    let fbo = gl.create_framebuffer().expect("framebuffer");
++                    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
++                    gl.framebuffer_texture_2d(
++                        glow::READ_FRAMEBUFFER,
++                        glow::COLOR_ATTACHMENT0,
++                        glow::TEXTURE_2D,
++                        Some(texture),
++                        0,
++                    );
++                    self.read_fbo.set(Some((fbo, texture)));
++                    fbo
++                }
++            };
++            let (sw, sh) = self.screen.get();
++            let (w, h) = (self.width as i32, self.height as i32);
++            // Scale to fit, keeping the aspect ratio (1:1 when drawn at screen size)
++            let scale = (sw as f32 / w as f32).min(sh as f32 / h as f32);
++            let (dw, dh) = ((w as f32 * scale) as i32, (h as f32 * scale) as i32);
++            let (dx, dy) = ((sw as i32 - dw) / 2, (sh as i32 - dh) / 2);
++            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
++            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
++            gl.disable(glow::SCISSOR_TEST);
++            gl.color_mask(true, true, true, true);
++            gl.viewport(0, 0, sw as i32, sh as i32);
++            if (dw, dh) != (sw as i32, sh as i32) {
++                gl.clear_color(0.0, 0.0, 0.0, 1.0);
++                gl.clear(glow::COLOR_BUFFER_BIT);
++            }
++            let filter = if (dw, dh) == (w, h) {
++                glow::NEAREST
++            } else {
++                glow::LINEAR
++            };
++            gl.blit_framebuffer(
++                0,
++                0,
++                w,
++                h,
++                dx,
++                dy + dh,
++                dx + dw,
++                dy,
++                glow::COLOR_BUFFER_BIT,
++                filter,
++            );
++            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
++        }
++    }
++}
++
++impl RenderTarget for SdlTarget {
++    type Frame = SdlFrame;
++
++    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
++        let (width, height) = (width.max(1), height.max(1));
++        if (width, height) != (self.width, self.height) {
++            self.texture = create_texture(device, width, height);
++            self.width = width;
++            self.height = height;
++        }
++    }
++
++    fn format(&self) -> wgpu::TextureFormat {
++        FORMAT
++    }
++
++    fn width(&self) -> u32 {
++        self.width
++    }
++
++    fn height(&self) -> u32 {
++        self.height
++    }
++
++    fn get_next_texture(&mut self) -> Option<Self::Frame> {
++        Some(SdlFrame(
++            self.texture
++                .create_view(&wgpu::TextureViewDescriptor::default()),
++        ))
++    }
++
++    fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
++        &self,
++        _device: &wgpu::Device,
++        queue: &wgpu::Queue,
++        command_buffers: I,
++        _frame: Self::Frame,
++    ) -> wgpu::SubmissionIndex {
++        // The GLES backend runs the commands right here, so the texture is ready for the blit.
++        let index = queue.submit(command_buffers);
++        self.blit();
++        index
++    }
++}
++
++struct FsCommands {
++    quit: Rc<Cell<bool>>,
++}
++
++impl FsCommandProvider for FsCommands {
++    fn on_fs_command(&self, command: &str, args: &str) -> bool {
++        match command {
++            "quit" => {
++                self.quit.set(true);
++                true
++            }
++            // Fancy Pants Adventures port: ask the launch script to start Ruffle again with `args`
++            // (it reads this line from stdout), so each world runs in a fresh process
++            "relaunch" => {
++                use std::io::Write;
++                println!("FPA_RELAUNCH {args}");
++                let _ = std::io::stdout().flush();
++                self.quit.set(true);
++                true
++            }
++            _ => false,
++        }
++    }
++}
++
++fn main() -> anyhow::Result<()> {
++    tracing_subscriber::fmt()
++        .with_env_filter(
++            tracing_subscriber::EnvFilter::try_from_default_env()
++                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
++        )
++        .init();
++    let opt = Opt::parse();
++
++    let fit = opt.stage_scale == "fit";
++    let data = std::fs::read(&opt.swf).with_context(|| format!("reading {:?}", opt.swf))?;
++    let swf_path = std::fs::canonicalize(&opt.swf).unwrap_or(opt.swf.clone());
++    let url = url::Url::from_file_path(&swf_path)
++        .map(|u| u.to_string())
++        .unwrap_or_else(|_| swf_path.to_string_lossy().into_owned());
++    let mut movie = SwfMovie::from_data(&data, url, None, None).context("parsing the SWF")?;
++    // Local files only, relative to the SWF's folder; futures run on `executor` in the main loop
++    let mut executor = NullExecutor::new();
++    let base_dir = swf_path
++        .parent()
++        .map(|p| p.to_path_buf())
++        .unwrap_or_default();
++    let navigator = NullNavigatorBackend::with_base_path(&base_dir, &executor)
++        .with_context(|| format!("SWF folder {base_dir:?}"))?;
++    drop(data);
++    movie.append_parameters(opt.parameters.clone());
++
++    // Mesa on X11 (PC tests): GLES needs EGL
++    sdl2::hint::set("SDL_VIDEO_X11_FORCE_EGL", "1");
++    let sdl = sdl2::init().map_err(|e| anyhow!(e))?;
++    let video = sdl.video().map_err(|e| anyhow!(e))?;
++    {
++        let attr = video.gl_attr();
++        attr.set_context_profile(sdl2::video::GLProfile::GLES);
++        attr.set_context_version(3, 0);
++        attr.set_red_size(8);
++        attr.set_green_size(8);
++        attr.set_blue_size(8);
++        attr.set_alpha_size(0);
++        attr.set_depth_size(0);
++        attr.set_stencil_size(0);
++        attr.set_double_buffer(true);
++    }
++    let (width, height) = match (opt.width, opt.height) {
++        (Some(w), Some(h)) => (w, h),
++        _ => {
++            let mode = video.desktop_display_mode(0).map_err(|e| anyhow!(e))?;
++            (mode.w as u32, mode.h as u32)
++        }
++    };
++    let mut builder = video.window("Ruffle", width, height);
++    builder.opengl().position_centered();
++    if opt.width.is_none() {
++        builder.fullscreen_desktop();
++    }
++    let window = builder.build()?;
++    let gl_context = window.gl_create_context().map_err(|e| anyhow!(e))?;
++    window
++        .gl_make_current(&gl_context)
++        .map_err(|e| anyhow!(e))?;
++    let _ = video.gl_set_swap_interval(1);
++    sdl.mouse().show_cursor(false);
++    let (width, height) = window.drawable_size();
++    let screen = Rc::new(Cell::new((width, height)));
++
++    let loader = |name: &str| video.gl_get_proc_address(name) as *const std::ffi::c_void;
++    let gl = Rc::new(unsafe { glow::Context::from_loader_function(loader) });
++    tracing::info!(
++        "GL: {} / {}",
++        unsafe { gl.get_parameter_string(glow::RENDERER) },
++        unsafe { gl.get_parameter_string(glow::VERSION) }
++    );
++
++    let mut gl_options = wgpu::GlBackendOptions::from_env_or_default();
++    if opt.gl_finish {
++        gl_options.fence_behavior = wgpu::GlFenceBehavior::AutoFinish;
++    }
++    let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
++    // No backend of its own: the adapter is SDL's context (a GL backend would open a second
++    // EGL display and context, ~80 MB with Mesa)
++    instance_desc.backends = wgpu::Backends::empty();
++    // Mali blob drivers crash in glPushDebugGroup (gfx-rs/wgpu#8937)
++    instance_desc.flags |= wgpu::InstanceFlags::DISCARD_HAL_LABELS;
++    let instance = wgpu::Instance::new(instance_desc);
++    let exposed = unsafe { wgpu_hal::gles::Adapter::new_external(loader, gl_options) }
++        .ok_or_else(|| anyhow!("wgpu could not use the GLES context (needs GLES 3.0)"))?;
++    let adapter = unsafe { instance.create_adapter_from_hal(exposed) };
++    tracing::info!("wgpu adapter: {:?}", adapter.get_info());
++    let (device, queue) = futures::executor::block_on(request_device(&adapter))?;
++    let descriptors = Arc::new(Descriptors::new(instance, adapter, device, queue));
++
++    let (rw, rh) = opt.render_size.unwrap_or((width, height));
++    let target = SdlTarget {
++        gl,
++        texture: create_texture(&descriptors.device, rw, rh),
++        width: rw,
++        height: rh,
++        screen: screen.clone(),
++        read_fbo: Cell::new(None),
++    };
++    let renderer =
++        WgpuRenderBackend::new(descriptors, target).map_err(|e| anyhow!(e.to_string()))?;
++
++    let quit = Rc::new(Cell::new(false));
++    let mut builder = PlayerBuilder::new()
++        .with_renderer(renderer)
++        .with_storage(Box::new(DiskStorageBackend::new(
++            opt.save_directory.clone(),
++        )))
++        .with_video(ruffle_video_software::backend::SoftwareVideoBackend::new())
++        .with_ui(NullUiBackend::new())
++        .with_navigator(navigator)
++        .with_fs_commands(Box::new(FsCommands { quit: quit.clone() }))
++        .with_player_runtime(opt.player_runtime)
++        .with_quality(opt.quality)
++        // fit: centred and scaled to fit, whatever the movie asks for (games set TOP_LEFT/NO_SCALE
++        // for desktop windows; on a fixed screen that leaves the picture in a corner)
++        .with_letterbox(if fit { Letterbox::On } else { Letterbox::Off })
++        .with_align(StageAlign::default(), fit)
++        .with_scale_mode(StageScaleMode::ShowAll, fit)
++        .with_autoplay(true)
++        .with_max_execution_duration(Duration::MAX)
++        .with_viewport_dimensions(rw, rh, 1.0)
++        .with_fullscreen(true)
++        .with_movie(movie);
++    // SDL audio first (the firmware's configured output), ALSA through cpal as the fallback
++    let sdl_audio = sdl
++        .audio()
++        .and_then(|audio| audio::SdlAudioBackend::new(&audio));
++    builder = match sdl_audio {
++        Ok(audio) => builder.with_audio(audio),
++        Err(sdl_error) => match CpalAudioBackend::new(None) {
++            Ok(audio) => builder.with_audio(audio),
++            Err(e) => {
++                tracing::error!("No audio: SDL: {sdl_error}; ALSA: {e}");
++                builder.with_audio(NullAudioBackend::new())
++            }
++        },
++    };
++    let player = builder.build();
++
++    let mut events = sdl.event_pump().map_err(|e| anyhow!(e))?;
++    let mut time = Instant::now();
++    let mut next_frame = time;
++    // Mouse position in movie (render target) pixels
++    let to_movie = |x: i32, y: i32| -> (f64, f64) {
++        let (sw, sh) = screen.get();
++        let scale = (sw as f64 / rw as f64).min(sh as f64 / rh as f64);
++        let (dx, dy) = (
++            (sw as f64 - rw as f64 * scale) / 2.0,
++            (sh as f64 - rh as f64 * scale) / 2.0,
++        );
++        ((x as f64 - dx) / scale, (y as f64 - dy) / scale)
++    };
++
++    // The collector frees garbage, but glibc keeps the freed memory: a game that builds a lot of
++    // temporary objects (Offspring Fling parses every level's XML at start) then holds hundreds of
++    // MB it does not use. Give it back every couple of seconds (RUFFLE_TRIM_SECS, 0 = never).
++    let trim_every = Duration::from_secs_f64(
++        std::env::var("RUFFLE_TRIM_SECS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(2.0),
++    );
++    let mut last_trim = Instant::now();
++    // A tick longer than this (RUFFLE_GC_LONG_TICK seconds, 0 = off) is a load: the game's init()
++    // and every level start build and drop hundreds of MB inside one tick. One full collection and
++    // a malloc_trim right after such a tick return that memory at once (Offspring Fling: 620 -> 400 MB)
++    // instead of over the next hundred ticks of the 1% push.
++    let long_tick = Duration::from_secs_f64(
++        std::env::var("RUFFLE_GC_LONG_TICK")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(1.0),
++    );
++    let mut collect_now = false;
++    // RUFFLE_SDL_TIMING=1: share of wall time in tick / render / swap, every 2 s
++    let timing_log = std::env::var_os("RUFFLE_SDL_TIMING").is_some();
++    let mut timing = (
++        Duration::ZERO,
++        Duration::ZERO,
++        Duration::ZERO,
++        0u32,
++        Instant::now(),
++    );
++    // Extra collector work per tick, as a fraction of a full cycle (RUFFLE_GC_STEP, 0 = off).
++    // 1% kept Offspring Fling at its live size (~560 MB on PC instead of 750+) at no frame cost.
++    let gc_step: f64 = std::env::var("RUFFLE_GC_STEP")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(0.01);
++
++    'main: loop {
++        let wait = next_frame.saturating_duration_since(Instant::now());
++        let first = if wait.is_zero() {
++            events.poll_event()
++        } else {
++            events.wait_event_timeout(wait.as_millis().max(1) as u32)
++        };
++        for event in first
++            .into_iter()
++            .chain(std::iter::from_fn(|| events.poll_event()))
++        {
++            let player_event = match event {
++                Event::Quit { .. } => break 'main,
++                Event::KeyDown {
++                    scancode,
++                    keycode,
++                    keymod,
++                    ..
++                } => PlayerEvent::KeyDown {
++                    key: keys::key_descriptor(scancode, keycode, keymod),
++                },
++                Event::KeyUp {
++                    scancode,
++                    keycode,
++                    keymod,
++                    ..
++                } => PlayerEvent::KeyUp {
++                    key: keys::key_descriptor(scancode, keycode, keymod),
++                },
++                Event::TextInput { text, .. } => {
++                    let mut player = player.lock().expect("player lock");
++                    for codepoint in text.chars() {
++                        player.handle_event(PlayerEvent::TextInput { codepoint });
++                    }
++                    continue;
++                }
++                Event::MouseMotion { x, y, .. } => {
++                    let (x, y) = to_movie(x, y);
++                    PlayerEvent::MouseMove { x, y }
++                }
++                Event::MouseButtonDown {
++                    mouse_btn, x, y, ..
++                } => {
++                    let (x, y) = to_movie(x, y);
++                    PlayerEvent::MouseDown {
++                        x,
++                        y,
++                        button: mouse_button(mouse_btn),
++                        index: None,
++                    }
++                }
++                Event::MouseButtonUp {
++                    mouse_btn, x, y, ..
++                } => {
++                    let (x, y) = to_movie(x, y);
++                    PlayerEvent::MouseUp {
++                        x,
++                        y,
++                        button: mouse_button(mouse_btn),
++                    }
++                }
++                Event::MouseWheel { y, .. } => PlayerEvent::MouseWheel {
++                    delta: MouseWheelDelta::Lines(y as f64),
++                },
++                Event::Window { win_event, .. } => match win_event {
++                    WindowEvent::FocusGained => PlayerEvent::FocusGained,
++                    WindowEvent::FocusLost => PlayerEvent::FocusLost,
++                    WindowEvent::SizeChanged(..) => {
++                        screen.set(window.drawable_size());
++                        continue;
++                    }
++                    _ => continue,
++                },
++                _ => continue,
++            };
++            player
++                .lock()
++                .expect("player lock")
++                .handle_event(player_event);
++        }
++        if quit.get() {
++            break;
++        }
++
++        // file loads started by the movie (Loader, URLLoader, loadMovie)
++        executor.run();
++
++        let now = Instant::now();
++        let dt = FloatDuration::from_std(now.duration_since(time));
++        if dt.as_millis() > 0.0 {
++            time = now;
++            let mut player = player.lock().expect("player lock");
++            if gc_step > 0.0 {
++                player.add_gc_work(gc_step);
++            }
++            let t0 = Instant::now();
++            player.tick(dt);
++            let t1 = Instant::now();
++            if !long_tick.is_zero() && t1 - t0 >= long_tick {
++                tracing::info!(
++                    "long tick: {:.2} s (a load; collecting after it)",
++                    (t1 - t0).as_secs_f64()
++                );
++                collect_now = true;
++            }
++            next_frame = now + player.time_til_next_frame();
++            timing.0 += t1 - t0;
++            if player.needs_render() {
++                player.render();
++                drop(player);
++                let t2 = Instant::now();
++                window.gl_swap_window();
++                timing.1 += t2 - t1;
++                timing.2 += t2.elapsed();
++                timing.3 += 1;
++            }
++            if timing_log && timing.4.elapsed() >= Duration::from_secs(2) {
++                let secs = timing.4.elapsed().as_secs_f64();
++                tracing::info!(
++                    "loop: tick {:.0}% render {:.0}% swap {:.0}% ({} renders, {:.1}/s)",
++                    timing.0.as_secs_f64() / secs * 100.0,
++                    timing.1.as_secs_f64() / secs * 100.0,
++                    timing.2.as_secs_f64() / secs * 100.0,
++                    timing.3,
++                    timing.3 as f64 / secs
++                );
++                timing = (
++                    Duration::ZERO,
++                    Duration::ZERO,
++                    Duration::ZERO,
++                    0,
++                    Instant::now(),
++                );
++            }
++        }
++        if collect_now || (!trim_every.is_zero() && last_trim.elapsed() >= trim_every) {
++            let (start, rss0) = (Instant::now(), rss_mb());
++            if collect_now {
++                player.lock().expect("player lock").collect_garbage_now();
++            }
++            unsafe { malloc_trim(0) };
++            tracing::debug!(
++                "trim{}: rss {rss0} -> {} MB in {:?}",
++                if collect_now {
++                    " (full collection after a long tick)"
++                } else {
++                    ""
++                },
++                rss_mb(),
++                start.elapsed()
++            );
++            collect_now = false;
++            last_trim = Instant::now();
++        }
++        if quit.get() {
++            break;
++        }
++    }
++
++    player.lock().expect("player lock").flush_shared_objects();
++    Ok(())
++}
++
++fn mouse_button(button: SdlMouseButton) -> MouseButton {
++    match button {
++        SdlMouseButton::Left => MouseButton::Left,
++        SdlMouseButton::Right => MouseButton::Right,
++        SdlMouseButton::Middle => MouseButton::Middle,
++        _ => MouseButton::Unknown,
++    }
++}
++
++unsafe extern "C" {
++    fn malloc_trim(pad: usize) -> i32;
++}
++
++fn rss_mb() -> u64 {
++    std::fs::read_to_string("/proc/self/statm")
++        .ok()
++        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
++        .map_or(0, |pages| pages * 4096 / (1024 * 1024))
++}

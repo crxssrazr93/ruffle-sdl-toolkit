@@ -1,0 +1,121 @@
+From 29617978f9e26a53a68ad06a81f1643e3bec610a Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 09:11:40 -0400
+Subject: [PATCH 09/14] core: blank BitmapData without resident pixels or zero
+ uploads
+
+Level caches are usually made of new BitmapData(w, h, true, 0) that are
+only drawn into on the GPU (BitmapData.draw) and displayed; their CPU pixels
+are never read. Two changes make such bitmaps cheap:
+
+* Zeroed pixels (RUFFLE_ZEROED_PIXELS=0 restores the old fill): an all-zero
+  bitmap gets its pixels from alloc_zeroed (calloc). vec![Color::default();
+  n] writes every pixel for a non-primitive type and so makes every page
+  resident; fresh zeroed pages only become resident once written.
+* Empty textures (RUFFLE_EMPTY_TEXTURES=0 restores the upload): when a
+  bitmap that is still all zero first needs a texture, it gets one from
+  create_empty_texture, which wgpu zero-initialises on the GPU, instead of an
+  upload of the zeros. That upload cost an RGBA copy of the pixels plus a
+  staging buffer as big as the bitmap until the next submit: for a cache of
+  dozens of bitmaps built in one tick, as much transient memory as the cache.
+
+Measured with the other memory changes on the PC: World 2 Level 1 peak
+326 -> 275 MB, World 3 Level 4 473 -> 346 MB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/src/bitmap/bitmap_data.rs | 66 +++++++++++++++++++++++++++++++---
+ 1 file changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/core/src/bitmap/bitmap_data.rs b/core/src/bitmap/bitmap_data.rs
+index 5939b738..8cf0d48f 100644
+--- a/core/src/bitmap/bitmap_data.rs
++++ b/core/src/bitmap/bitmap_data.rs
+@@ -410,6 +410,37 @@ pub struct BitmapRawData<'gc> {
+     pub egui_texture: std::cell::RefCell<Option<egui::TextureHandle>>,
+ }
+ 
++/// PortMaster port: `RUFFLE_EMPTY_TEXTURES` (default on; "0" turns it off), see
++/// `BitmapRawData::try_bitmap_handle`.
++fn empty_textures() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("RUFFLE_EMPTY_TEXTURES").map_or(true, |v| v != "0"))
++}
++
++/// PortMaster port: `RUFFLE_ZEROED_PIXELS` (default on; "0" turns it off), see `BitmapRawData::new`.
++fn zeroed_pixels() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("RUFFLE_ZEROED_PIXELS").map_or(true, |v| v != "0"))
++}
++
++/// PortMaster port: `len` zero colours from `alloc_zeroed` (calloc), which `vec![Color::default(); n]`
++/// does not use for a non-primitive type: it writes every pixel and makes every page resident.
++fn zeroed_color_vec(len: usize) -> Vec<Color> {
++    if len == 0 {
++        return Vec::new();
++    }
++    let layout = std::alloc::Layout::array::<Color>(len).expect("bitmap size overflow");
++    // SAFETY: the layout is non-zero sized; an all-zero `Color` (four u8) is valid; the pointer
++    // comes from the global allocator with the layout of `len` colours, as `Vec` requires.
++    unsafe {
++        let ptr = std::alloc::alloc_zeroed(layout).cast::<Color>();
++        if ptr.is_null() {
++            std::alloc::handle_alloc_error(layout);
++        }
++        Vec::from_raw_parts(ptr, len, len)
++    }
++}
++
+ #[derive(Clone, Debug)]
+ pub enum DirtyState {
+     // Both the CPU and GPU pixels are up to date. We do not need to wait for any syncs to complete
+@@ -741,11 +772,18 @@ impl std::fmt::Debug for BitmapRawData<'_> {
+ 
+ impl<'gc> BitmapRawData<'gc> {
+     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
++        let fill = Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
++        let len = width as usize * height as usize;
+         Self {
+-            pixels: vec![
+-                Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
+-                width as usize * height as usize
+-            ],
++            // PortMaster port: an all-zero bitmap (transparent black, the usual cache canvas)
++            // comes from a zeroed allocation: big ones are fresh pages that only become resident
++            // once written, so a bitmap that is only drawn into on the GPU and displayed costs no
++            // CPU memory (`RUFFLE_ZEROED_PIXELS=0` fills it as before).
++            pixels: if fill == Color::default() && zeroed_pixels() {
++                zeroed_color_vec(len)
++            } else {
++                vec![fill; len]
++            },
+             width,
+             height,
+             transparency,
+@@ -802,6 +840,26 @@ impl<'gc> BitmapRawData<'gc> {
+             return Ok(handle.clone());
+         }
+ 
++        // PortMaster port (`RUFFLE_EMPTY_TEXTURES`, default on, "0" turns it off): a bitmap
++        // that is still all zero (a fresh cache canvas) gets an empty texture, which wgpu
++        // zero-initialises on the GPU. Uploading the zeros cost an RGBA copy of the pixels and
++        // a staging buffer as big as the bitmap until the next submit: for a level cache made of
++        // dozens of bitmaps in one tick, as much transient memory as the cache itself.
++        if empty_textures()
++            && let (Some(width), Some(height)) = (
++                std::num::NonZeroU32::new(self.width()),
++                std::num::NonZeroU32::new(self.height()),
++            )
++            && bytemuck::cast_slice::<Color, u8>(&self.pixels)
++                .iter()
++                .all(|b| *b == 0)
++            && let Ok(handle) = renderer.create_empty_texture(width, height)
++        {
++            self.dirty_state = DirtyState::Clean;
++            self.bitmap_handle = Some(handle.clone());
++            return Ok(handle);
++        }
++
+         let bitmap = Bitmap::new(
+             self.width(),
+             self.height(),

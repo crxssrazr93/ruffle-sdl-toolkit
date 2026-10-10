@@ -1,0 +1,48 @@
+From ca44da733cdf6df2b2f6e599f52d07bfce8470ed Mon Sep 17 00:00:00 2001
+From: crxssrazr93 <crxssrazr93@gmail.com>
+Date: Sat, 10 Oct 2026 21:18:03 +0530
+Subject: [PATCH 14/14] ruffle_sdl, desktop: generic RUFFLE_RELAUNCH marker,
+ drop PORT_EXP experiment
+
+The relaunch fscommand prints "RUFFLE_RELAUNCH <args>" on stdout (ruffle_sdl and
+the desktop player) instead of a marker named after one game, so any port launch
+script can restart Ruffle with new arguments.
+
+The PORT_EXP draw-skipping experiment from the early Stage3D work is already
+gone at this point of the series, so nothing is left to remove.
+---
+ desktop/src/backends/fscommand.rs | 2 +-
+ sdl/src/main.rs                   | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/desktop/src/backends/fscommand.rs b/desktop/src/backends/fscommand.rs
+index 9eba866b..bca4aeac 100644
+--- a/desktop/src/backends/fscommand.rs
++++ b/desktop/src/backends/fscommand.rs
+@@ -17,7 +17,7 @@ impl FsCommandProvider for DesktopFSCommandProvider {
+             // this line from stdout), so that each game starts in a fresh process.
+             "relaunch" => {
+                 use std::io::Write;
+-                println!("FPA_RELAUNCH {args}");
++                println!("RUFFLE_RELAUNCH {args}");
+                 let _ = std::io::stdout().flush();
+                 let _ = self.event_loop.send_event(RuffleEvent::ExitRequested);
+             }
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index 09539e00..b6c01c13 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -270,11 +270,11 @@ impl FsCommandProvider for FsCommands {
+                 self.quit.set(true);
+                 true
+             }
+-            // Fancy Pants Adventures port: ask the launch script to start Ruffle again with `args`
++            // ask the launch script to start Ruffle again with `args`
+             // (it reads this line from stdout), so each world runs in a fresh process
+             "relaunch" => {
+                 use std::io::Write;
+-                println!("FPA_RELAUNCH {args}");
++                println!("RUFFLE_RELAUNCH {args}");
+                 let _ = std::io::stdout().flush();
+                 self.quit.set(true);
+                 true

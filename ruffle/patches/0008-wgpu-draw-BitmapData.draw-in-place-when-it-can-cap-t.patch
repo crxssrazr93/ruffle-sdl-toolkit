@@ -1,0 +1,393 @@
+From 09adda8f338591b31b3302b0e4b990ea751ccf14 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 09:10:36 -0400
+Subject: [PATCH 08/14] wgpu: draw BitmapData.draw in place when it can, cap
+ the offscreen pool
+
+render_offscreen copies the target texture into a pooled frame buffer of the
+same size, draws there and copies the result back. The pool keeps one frame
+buffer per size until the end of the frame, and the command encoder keeps
+them alive until it is submitted. Games that build a level cache out of
+dozens of large BitmapData in one tick (Fancy Pants Adventures World 3 Level
+4: 65 tiles, 76 MB of pooled frame buffers) briefly doubled the cache memory
+on the GPU.
+
+* In place (RUFFLE_DRAW_IN_PLACE=0 restores the old path): at one sample
+  per pixel, when the commands do not sample the target itself, they are
+  drawn straight into the bitmap texture with the new
+  RenderTargetMode::ExistingKeep (load, no clear). The check walks the
+  command list: bitmaps, Stage3D outputs, shape bitmap fills (meshes now
+  keep the handles of the bitmaps their fills sample), masks and blend
+  lists. Multisampled quality and self-sampling draws keep the old path.
+* Pool cap (RUFFLE_DRAW_POOL_MB, default 16, 0 = off): once the remaining
+  pooled draws since the last trim add up to that many MB, the work is
+  submitted and the offscreen pool emptied, so their frame buffers are freed
+  before the frame ends.
+
+The result of a draw is the same either way. Measured with the other memory
+changes on the PC: World 3 Level 4 peak 546 -> 473 MB, World 2 Level 1
+351 -> 326 MB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ render/wgpu/src/backend.rs        | 135 ++++++++++++++++++++++++++++++
+ render/wgpu/src/mesh.rs           |   9 +-
+ render/wgpu/src/surface/target.rs |  73 ++++++++++------
+ 3 files changed, 189 insertions(+), 28 deletions(-)
+
+diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
+index 80cc84d7..147f70e4 100644
+--- a/render/wgpu/src/backend.rs
++++ b/render/wgpu/src/backend.rs
+@@ -79,6 +79,9 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
+     viewport_scale_factor: f64,
+     texture_pool: TexturePool,
+     offscreen_texture_pool: TexturePool,
++    /// PortMaster port: bytes of pooled offscreen draws since the pool was last emptied
++    /// (`RUFFLE_DRAW_POOL_MB`).
++    offscreen_draw_bytes: u64,
+     pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
+     dynamic_transforms: DynamicTransforms,
+     active_frame: ActiveFrame,
+@@ -276,6 +279,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
+             viewport_scale_factor: 1.0,
+             texture_pool: TexturePool::new(),
+             offscreen_texture_pool: TexturePool::new(),
++            offscreen_draw_bytes: 0,
+             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
+             dynamic_transforms: transforms,
+             active_frame,
+@@ -342,6 +346,13 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
+             wgpu::BufferUsages::INDEX,
+         );
+ 
++        let bitmaps = draws
++            .iter()
++            .filter_map(|d| match &d.draw_type {
++                crate::mesh::PendingDrawType::Bitmap { handle, .. } => Some(handle.clone()),
++                _ => None,
++            })
++            .collect();
+         let draws = draws
+             .into_iter()
+             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
+@@ -351,6 +362,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
+             draws,
+             vertex_buffer,
+             index_buffer,
++            bitmaps,
+         }
+     }
+ 
+@@ -421,6 +433,55 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
+             }) => unreachable!("Buffer must be Borrowed as it was set to be Borrowed earlier"),
+         }
+     }
++
++    /// PortMaster port: `render_offscreen` for a single-sampled draw whose commands do not
++    /// sample `handle`. The commands are drawn straight into the bitmap's texture
++    /// (`ExistingKeep`: its content is loaded), with no pooled frame buffer of the same size,
++    /// no copy into it and no copy back.
++    fn render_offscreen_in_place(
++        &mut self,
++        handle: BitmapHandle,
++        commands: CommandList,
++        quality: StageQuality,
++        bounds: PixelRegion,
++    ) -> Box<QueueSyncHandle> {
++        let format = wgpu::TextureFormat::Rgba8Unorm;
++        let texture = as_texture(&handle);
++        let extent = wgpu::Extent3d {
++            width: texture.texture.width(),
++            height: texture.texture.height(),
++            depth_or_array_layers: 1,
++        };
++        let surface = Surface::new(
++            &self.descriptors,
++            quality,
++            extent.width,
++            extent.height,
++            format,
++        );
++        let _target = surface.draw_commands(
++            RenderTargetMode::ExistingKeep(texture.texture.clone()),
++            &self.descriptors,
++            &self.meshes,
++            commands,
++            &mut self.active_frame.staging_belt,
++            &self.dynamic_transforms,
++            &mut self.profiler.scope(
++                "Offscreen commands in place",
++                &mut self.active_frame.command_encoder,
++            ),
++            LayerRef::Current,
++            &mut self.offscreen_texture_pool,
++        );
++        self.active_frame.maybe_flush(&self.descriptors);
++        let target = TextureTarget {
++            size: extent,
++            texture: texture.texture.clone(),
++            format,
++            buffer: None,
++        };
++        self.make_queue_sync_handle(target, None, handle, bounds)
++    }
+ }
+ 
+ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+@@ -669,6 +730,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+         self.active_frame
+             .submit_for_target(&self.descriptors, &self.target, frame_output);
+         self.offscreen_texture_pool = TexturePool::new();
++        self.offscreen_draw_bytes = 0;
+         self.profiler
+             .end_frame()
+             .expect("Frame should end successfully");
+@@ -799,6 +861,21 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+         quality: StageQuality,
+         bounds: PixelRegion,
+     ) -> Option<Box<dyn SyncHandle>> {
++        // PortMaster port (`RUFFLE_DRAW_IN_PLACE`, default on, "0" turns it off): at one sample
++        // per pixel a draw that does not sample its own target renders straight into the
++        // target's texture. The usual path copies the texture into a pooled frame buffer of the
++        // same size, draws there and copies back; the pool keeps one such buffer per size until
++        // the next frame (`RUFFLE_DRAW_POOL_MB` below bounds that for the draws that remain).
++        if draw_in_place()
++            && crate::utils::supported_sample_count(
++                &self.descriptors.adapter,
++                quality.sample_count(),
++                wgpu::TextureFormat::Rgba8Unorm,
++            ) == 1
++            && !commands_sample(&commands, &handle)
++        {
++            return Some(self.render_offscreen_in_place(handle, commands, quality, bounds));
++        }
+         let texture = as_texture(&handle);
+ 
+         let extent = wgpu::Extent3d {
+@@ -841,6 +918,20 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+         );
+ 
+         self.active_frame.maybe_flush(&self.descriptors);
++        // PortMaster port (`RUFFLE_DRAW_POOL_MB`, default 16, 0 = off): the pool keeps a frame
++        // buffer of every size drawn into until the end of the frame, and the encoder keeps them
++        // all alive until it is submitted. A level cache of 65 bitmaps built in one tick (World 3
++        // of Fancy Pants Adventures) held 76 MB of them. Once the draws since the last trim add up
++        // to this much, the work is submitted and the pool emptied, so their memory is freed.
++        let limit = draw_pool_limit();
++        if limit > 0 {
++            self.offscreen_draw_bytes += u64::from(extent.width) * u64::from(extent.height) * 4;
++            if self.offscreen_draw_bytes >= limit {
++                self.active_frame.submit_direct(&self.descriptors);
++                self.offscreen_texture_pool = TexturePool::new();
++                self.offscreen_draw_bytes = 0;
++            }
++        }
+         Some(self.make_queue_sync_handle(target, None, handle, bounds))
+     }
+ 
+@@ -1264,6 +1355,9 @@ pub enum RenderTargetMode {
+     FreshWithTexture(wgpu::Texture),
+     // Use the provided texture as our frame buffer, and clear it with the given color.
+     ExistingWithColor(wgpu::Texture, wgpu::Color),
++    // PortMaster port: use the provided texture as our frame buffer and keep its content (load,
++    // no clear). The commands must not sample this texture.
++    ExistingKeep(wgpu::Texture),
+ }
+ 
+ impl RenderTargetMode {
+@@ -1272,6 +1366,7 @@ impl RenderTargetMode {
+             RenderTargetMode::FreshWithColor(color) => Some(*color),
+             RenderTargetMode::FreshWithTexture(_) => None,
+             RenderTargetMode::ExistingWithColor(_, color) => Some(*color),
++            RenderTargetMode::ExistingKeep(_) => None,
+         }
+     }
+ }
+@@ -1345,3 +1440,43 @@ impl ActiveFrame {
+         }
+     }
+ }
++
++/// PortMaster port: `RUFFLE_DRAW_IN_PLACE` (default on; "0" turns it off), see `render_offscreen`.
++fn draw_in_place() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("RUFFLE_DRAW_IN_PLACE").map_or(true, |v| v != "0"))
++}
++
++/// PortMaster port: whether `commands` sample `target` (a bitmap, a shape's bitmap fill, nested
++/// lists), which rules out rendering into it in place.
++fn commands_sample(commands: &CommandList, target: &BitmapHandle) -> bool {
++    let same =
++        |handle: &BitmapHandle| std::ptr::addr_eq(Arc::as_ptr(&handle.0), Arc::as_ptr(&target.0));
++    commands.commands.iter().any(|command| match command {
++        ruffle_render::commands::Command::RenderBitmap { bitmap, .. }
++        | ruffle_render::commands::Command::RenderStage3D { bitmap, .. } => same(bitmap),
++        ruffle_render::commands::Command::RenderShape { shape, .. } => {
++            crate::mesh::as_mesh(shape).bitmaps.iter().any(same)
++        }
++        ruffle_render::commands::Command::RenderAlphaMask {
++            maskee_commands,
++            mask_commands,
++        } => commands_sample(maskee_commands, target) || commands_sample(mask_commands, target),
++        ruffle_render::commands::Command::Blend(list, _) => commands_sample(list, target),
++        _ => false,
++    })
++}
++
++/// PortMaster port: `RUFFLE_DRAW_POOL_MB` (default 16; 0 turns it off) in bytes, see
++/// `render_offscreen`.
++fn draw_pool_limit() -> u64 {
++    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *LIMIT.get_or_init(|| {
++        std::env::var("RUFFLE_DRAW_POOL_MB")
++            .ok()
++            .and_then(|v| v.parse::<u64>().ok())
++            .unwrap_or(16)
++            * 1024
++            * 1024
++    })
++}
+diff --git a/render/wgpu/src/mesh.rs b/render/wgpu/src/mesh.rs
+index f733f23f..8bfa4d50 100644
+--- a/render/wgpu/src/mesh.rs
++++ b/render/wgpu/src/mesh.rs
+@@ -7,7 +7,7 @@ use wgpu::util::DeviceExt;
+ 
+ use crate::buffer_builder::BufferBuilder;
+ use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
+-use ruffle_render::bitmap::BitmapSource;
++use ruffle_render::bitmap::{BitmapHandle, BitmapSource};
+ use ruffle_render::tessellator::{Bitmap, Draw as LyonDraw, DrawType as TessDrawType, Gradient};
+ use swf::{CharacterId, GradientInterpolation};
+ 
+@@ -19,6 +19,9 @@ pub struct Mesh {
+     pub draws: Vec<Draw>,
+     pub vertex_buffer: wgpu::Buffer,
+     pub index_buffer: wgpu::Buffer,
++    /// PortMaster port: the bitmaps the mesh's fills sample (so an offscreen draw can tell
++    /// whether it samples its own target).
++    pub bitmaps: Vec<BitmapHandle>,
+ }
+ 
+ impl ShapeHandleImpl for Mesh {}
+@@ -139,6 +142,7 @@ pub enum PendingDrawType {
+     },
+     Bitmap {
+         binds: BitmapBinds,
++        handle: BitmapHandle,
+     },
+ }
+ 
+@@ -187,6 +191,7 @@ impl PendingDrawType {
+ 
+         Some(PendingDrawType::Bitmap {
+             binds: binds.clone(),
++            handle,
+         })
+     }
+ 
+@@ -233,7 +238,7 @@ impl PendingDrawType {
+                     });
+                 DrawType::Gradient { bind_group }
+             }
+-            PendingDrawType::Bitmap { binds } => DrawType::Bitmap { binds },
++            PendingDrawType::Bitmap { binds, .. } => DrawType::Bitmap { binds },
+         }
+     }
+ }
+diff --git a/render/wgpu/src/surface/target.rs b/render/wgpu/src/surface/target.rs
+index 1cfe3dc5..b72dcc71 100644
+--- a/render/wgpu/src/surface/target.rs
++++ b/render/wgpu/src/surface/target.rs
+@@ -232,36 +232,40 @@ impl CommandTarget {
+             )
+         };
+ 
+-        let (frame_buffer, resolve_buffer) =
+-            if let RenderTargetMode::ExistingWithColor(texture, _) = &render_target_mode {
+-                if sample_count > 1 {
+-                    (
+-                        make_pooled_frame_buffer(),
+-                        Some(ResolveBuffer::new_manual(texture.clone())),
+-                    )
+-                } else {
+-                    (
+-                        FrameBuffer::new_manual(texture.clone(), texture.size()),
+-                        None,
+-                    )
+-                }
+-            } else if sample_count > 1 {
++        let existing = match &render_target_mode {
++            RenderTargetMode::ExistingWithColor(texture, _)
++            | RenderTargetMode::ExistingKeep(texture) => Some(texture),
++            _ => None,
++        };
++        let (frame_buffer, resolve_buffer) = if let Some(texture) = existing {
++            if sample_count > 1 {
+                 (
+                     make_pooled_frame_buffer(),
+-                    Some(ResolveBuffer::new(
+-                        descriptors,
+-                        size,
+-                        format,
+-                        wgpu::TextureUsages::COPY_SRC
+-                            | wgpu::TextureUsages::COPY_DST
+-                            | wgpu::TextureUsages::TEXTURE_BINDING
+-                            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+-                        pool,
+-                    )),
++                    Some(ResolveBuffer::new_manual(texture.clone())),
+                 )
+             } else {
+-                (make_pooled_frame_buffer(), None)
+-            };
++                (
++                    FrameBuffer::new_manual(texture.clone(), texture.size()),
++                    None,
++                )
++            }
++        } else if sample_count > 1 {
++            (
++                make_pooled_frame_buffer(),
++                Some(ResolveBuffer::new(
++                    descriptors,
++                    size,
++                    format,
++                    wgpu::TextureUsages::COPY_SRC
++                        | wgpu::TextureUsages::COPY_DST
++                        | wgpu::TextureUsages::TEXTURE_BINDING
++                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
++                    pool,
++                )),
++            )
++        } else {
++            (make_pooled_frame_buffer(), None)
++        };
+ 
+         if let RenderTargetMode::FreshWithTexture(texture) = &render_target_mode {
+             if let Some(resolve_buffer) = &resolve_buffer {
+@@ -295,6 +299,23 @@ impl CommandTarget {
+             }
+         }
+ 
++        // PortMaster port: a kept texture behind a multisampled frame buffer (it is the resolve
++        // target) starts the frame buffer with its content. At one sample the texture is the
++        // frame buffer itself and is simply loaded.
++        if let RenderTargetMode::ExistingKeep(texture) = &render_target_mode
++            && sample_count > 1
++        {
++            run_copy_pipeline(
++                descriptors,
++                format,
++                frame_buffer.texture.view(),
++                &texture.create_view(&Default::default()),
++                &globals,
++                sample_count,
++                encoder,
++            );
++        }
++
+         Self {
+             frame_buffer,
+             blend_buffer: OnceCell::new(),

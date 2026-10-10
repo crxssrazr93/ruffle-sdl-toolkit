@@ -1,0 +1,15 @@
+# Ruffle patch series, applied in order with git am onto the commit in PIN.
+0001-avm2-implement-Graphics.readGraphicsData.patch
+0002-PortMaster-port-Stage3D-batching-pipeline-bind-group.patch
+0003-PortMaster-port-keep-Stage3D-texture-uploads-on-the-.patch
+0004-PortMaster-port-lazy-mouse-picking-and-frame-skipping.patch
+0005-core-Player-add_gc_work-and-Player-collect_garbage_n.patch
+0006-ruffle_sdl-Ruffle-on-SDL2-and-GLES-3-for-handhelds.patch
+0007-core-tessellate-DefineShapes-on-first-render-parse-s.patch
+0008-wgpu-draw-BitmapData.draw-in-place-when-it-can-cap-t.patch
+0009-core-blank-BitmapData-without-resident-pixels-or-zer.patch
+0010-Memory-accounting-by-category-RUFFLE_MEMLOG-sampled-.patch
+0011-PortMaster-port-Stage3D-uploads-without-a-submit-con.patch
+0012-ruffle_sdl-run-with-SDL-2.0.10.patch
+0013-ruffle_sdl-minimum-key-hold-so-games-that-poll-keys-.patch
+0014-ruffle_sdl-desktop-generic-RUFFLE_RELAUNCH-marker.patch

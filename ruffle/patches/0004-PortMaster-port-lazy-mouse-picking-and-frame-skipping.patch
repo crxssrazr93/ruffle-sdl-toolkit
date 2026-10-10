@@ -1,0 +1,81 @@
+From 84f53cd82c1c0f3344639e8c282d5167e91acfdc Mon Sep 17 00:00:00 2001
+From: crxssrazr93 <crxssrazr93@gmail.com>
+Date: Tue, 6 Oct 2026 05:34:42 +0530
+Subject: [PATCH 04/14] PortMaster port: lazy mouse picking and frame skipping
+ for frame-based AVM1 games
+
+RUFFLE_LAZY_MOUSE_PICK: only pick the object under the mouse again when the
+mouse moves or a button changes. Re-picking every frame walked every clip of
+Fancy Pants World 3's levels and took about a third of the frame time on a
+Cortex-A53.
+
+RUFFLE_FRAMESKIP: allow a second frame per tick when frames run slow, so
+frame-based games keep their speed and only the picture skips frames.
+---
+ core/src/player.rs | 38 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 6fd49924..e64d57ed 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -520,7 +520,16 @@ impl Player {
+             let frame_time = self.frame_time(1000.0);
+             let average_run_frame_time = self.recent_run_frame_timings.iter().sum::<f64>()
+                 / self.recent_run_frame_timings.len() as f64;
+-            ((frame_time / average_run_frame_time) as u32).clamp(1, MAX_FRAMES_PER_TICK)
++            let frames =
++                ((frame_time / average_run_frame_time) as u32).clamp(1, MAX_FRAMES_PER_TICK);
++            // PortMaster port: frame-based games (Fancy Pants World 3) slow down whenever a
++            // frame takes longer than the frame time. With RUFFLE_FRAMESKIP set, allow a
++            // second frame per tick so game speed holds and only the picture skips frames.
++            if port_frameskip() {
++                frames.max(2)
++            } else {
++                frames
++            }
+         }
+     }
+ 
+@@ -1576,10 +1585,17 @@ impl Player {
+                 && changed_mouse_buttons.is_empty()
+                 && context.mouse_data.hovered.is_some();
+ 
+-            let new_over_object = if mouse_in_stage {
+-                run_mouse_pick(context, true)
+-            } else {
++            let new_over_object = if !mouse_in_stage {
+                 None
++            } else if port_lazy_mouse_pick() && !is_mouse_moved && changed_mouse_buttons.is_empty()
++            {
++                // PortMaster port: re-picking every frame walks every clip of a large AVM1
++                // level (a third of the frame time in Fancy Pants World 3 on a Cortex-A53).
++                // With RUFFLE_LAZY_MOUSE_PICK set, only pick again when the mouse moves or
++                // clicks.
++                context.mouse_data.hovered
++            } else {
++                run_mouse_pick(context, true)
+             };
+             let mut events: smallvec::SmallVec<[(InteractiveObject<'_>, ClipEvent); 2]> =
+                 Default::default();
+@@ -3325,6 +3341,20 @@ pub enum PlayerMode {
+ 
+ /// Opt-in performance log for the PortMaster port: set RUFFLE_FPS_LOG=1 to print, every two
+ /// seconds, how many frames were run and rendered and how long each took on average.
++/// PortMaster port: see `Player::update_mouse_state`.
++fn port_lazy_mouse_pick() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var("RUFFLE_LAZY_MOUSE_PICK").is_ok_and(|v| !v.is_empty() && v != "0")
++    })
++}
++
++/// PortMaster port: see `Player::max_frames_per_tick`.
++fn port_frameskip() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("RUFFLE_FRAMESKIP").is_ok_and(|v| !v.is_empty() && v != "0"))
++}
++
+ #[cfg(not(target_family = "wasm"))]
+ mod port_fps {
+     use std::sync::{Mutex, OnceLock};

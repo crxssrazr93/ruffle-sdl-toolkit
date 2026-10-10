@@ -1,0 +1,772 @@
+From 5b6521f6db72ca90ef961b1353b18cf66ca61881 Mon Sep 17 00:00:00 2001
+From: crxssrazr93 <crxssrazr93@gmail.com>
+Date: Sun, 4 Oct 2026 22:57:40 +0530
+Subject: [PATCH 02/14] PortMaster port: Stage3D batching, pipeline/bind group
+ caches, TextureBase.dispose, relaunch fscommand, FPS log
+
+---
+ .../avm2/globals/flash/display3D/textures.rs  |   1 +
+ .../flash/display3D/textures/TextureBase.as   |   4 +-
+ .../flash/display3D/textures/texture_base.rs  |  16 ++
+ core/src/avm2/object/context3d_object.rs      |   4 +
+ core/src/player.rs                            |  77 ++++++
+ desktop/src/backends/fscommand.rs             |   8 +
+ render/src/backend.rs                         |   4 +
+ render/wgpu/src/context3d/current_pipeline.rs | 231 +++++++++++++-----
+ render/wgpu/src/context3d/mod.rs              | 138 +++++++----
+ render/wgpu/src/context3d/shader_pair.rs      |   2 +-
+ 10 files changed, 368 insertions(+), 117 deletions(-)
+ create mode 100644 core/src/avm2/globals/flash/display3D/textures/texture_base.rs
+
+diff --git a/core/src/avm2/globals/flash/display3D/textures.rs b/core/src/avm2/globals/flash/display3D/textures.rs
+index 196abe1b..9c4c2f33 100644
+--- a/core/src/avm2/globals/flash/display3D/textures.rs
++++ b/core/src/avm2/globals/flash/display3D/textures.rs
+@@ -9,3 +9,4 @@ mod atf_jpegxr;
+ pub mod cube_texture;
+ pub mod rectangle_texture;
+ pub mod texture;
++pub mod texture_base;
+diff --git a/core/src/avm2/globals/flash/display3D/textures/TextureBase.as b/core/src/avm2/globals/flash/display3D/textures/TextureBase.as
+index 3608f37b..0a9f3e4f 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/TextureBase.as
++++ b/core/src/avm2/globals/flash/display3D/textures/TextureBase.as
+@@ -5,8 +5,6 @@ package flash.display3D.textures {
+ 
+     [API("674")]
+     public class TextureBase extends EventDispatcher {
+-        public function dispose():void {
+-            stub_method("flash.display3D.textures.TextureBase", "dispose");
+-        }
++        public native function dispose():void;
+     }
+ }
+diff --git a/core/src/avm2/globals/flash/display3D/textures/texture_base.rs b/core/src/avm2/globals/flash/display3D/textures/texture_base.rs
+new file mode 100644
+index 00000000..f6fa9b5e
+--- /dev/null
++++ b/core/src/avm2/globals/flash/display3D/textures/texture_base.rs
+@@ -0,0 +1,16 @@
++use crate::avm2::Activation;
++use crate::avm2::Error;
++use crate::avm2::Value;
++use crate::avm2::function::FunctionArgs;
++
++/// `TextureBase.dispose()`: frees the texture's GPU memory immediately, as Flash does.
++pub fn dispose<'gc>(
++    _activation: &mut Activation<'_, 'gc>,
++    this: Value<'gc>,
++    _args: FunctionArgs<'_, 'gc>,
++) -> Result<Value<'gc>, Error<'gc>> {
++    if let Some(texture) = this.as_object().and_then(|o| o.as_texture()) {
++        texture.context3d().dispose_texture(texture.handle());
++    }
++    Ok(Value::Undefined)
++}
+diff --git a/core/src/avm2/object/context3d_object.rs b/core/src/avm2/object/context3d_object.rs
+index f77568c1..7e85dae7 100644
+--- a/core/src/avm2/object/context3d_object.rs
++++ b/core/src/avm2/object/context3d_object.rs
+@@ -387,6 +387,10 @@ impl<'gc> Context3DObject<'gc> {
+         });
+     }
+ 
++    pub(crate) fn dispose_texture(self, texture: Rc<dyn Texture>) {
++        self.with_context_3d(|ctx| ctx.process_command(Context3DCommand::DisposeTexture { texture }));
++    }
++
+     pub(crate) fn set_texture_at(self, sampler: u32, texture: Option<Rc<dyn Texture>>, cube: bool) {
+         self.with_context_3d(|ctx| {
+             ctx.process_command(Context3DCommand::SetTextureAt {
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 675ef3a7..6fd49924 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2050,6 +2050,7 @@ impl Player {
+ 
+     #[instrument(level = "debug", skip_all)]
+     pub fn run_frame(&mut self) {
++        let _port_fps = port_fps::Timer::new(false);
+         let frame_time = self.frame_time(750_000_000.0);
+         let frame_time = Duration::from_nanos(frame_time as u64);
+         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
+@@ -2088,6 +2089,7 @@ impl Player {
+ 
+     #[instrument(level = "debug", skip_all)]
+     pub fn render(&mut self) {
++        let _port_fps = port_fps::Timer::new(true);
+         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
+ 
+         if invalidated {
+@@ -3320,3 +3322,78 @@ pub enum PlayerMode {
+     /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
+     Debug,
+ }
++
++/// Opt-in performance log for the PortMaster port: set RUFFLE_FPS_LOG=1 to print, every two
++/// seconds, how many frames were run and rendered and how long each took on average.
++#[cfg(not(target_family = "wasm"))]
++mod port_fps {
++    use std::sync::{Mutex, OnceLock};
++    use std::time::{Duration, Instant};
++
++    struct Stats {
++        start: Instant,
++        frames: u32,
++        renders: u32,
++        logic: Duration,
++        render: Duration,
++    }
++
++    static STATS: Mutex<Option<Stats>> = Mutex::new(None);
++
++    fn enabled() -> bool {
++        static ENABLED: OnceLock<bool> = OnceLock::new();
++        *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_FPS_LOG").is_some())
++    }
++
++    pub struct Timer(Option<(Instant, bool)>);
++
++    impl Timer {
++        pub fn new(render: bool) -> Self {
++            Self(enabled().then(|| (Instant::now(), render)))
++        }
++    }
++
++    impl Drop for Timer {
++        fn drop(&mut self) {
++            let Some((t0, render)) = self.0 else { return };
++            let now = Instant::now();
++            let mut guard = STATS.lock().unwrap();
++            let s = guard.get_or_insert_with(|| Stats {
++                start: now,
++                frames: 0,
++                renders: 0,
++                logic: Duration::ZERO,
++                render: Duration::ZERO,
++            });
++            if render {
++                s.renders += 1;
++                s.render += now - t0;
++            } else {
++                s.frames += 1;
++                s.logic += now - t0;
++            }
++            let span = now - s.start;
++            if span >= Duration::from_secs(2) {
++                let secs = span.as_secs_f64();
++                tracing::info!(
++                    "port_fps: {:.1} frames/s ({:.1} ms logic), {:.1} renders/s ({:.1} ms render)",
++                    s.frames as f64 / secs,
++                    s.logic.as_secs_f64() * 1000.0 / s.frames.max(1) as f64,
++                    s.renders as f64 / secs,
++                    s.render.as_secs_f64() * 1000.0 / s.renders.max(1) as f64,
++                );
++                *guard = None;
++            }
++        }
++    }
++}
++
++#[cfg(target_family = "wasm")]
++mod port_fps {
++    pub struct Timer;
++    impl Timer {
++        pub fn new(_render: bool) -> Self {
++            Self
++        }
++    }
++}
+diff --git a/desktop/src/backends/fscommand.rs b/desktop/src/backends/fscommand.rs
+index 7f9fc62f..9eba866b 100644
+--- a/desktop/src/backends/fscommand.rs
++++ b/desktop/src/backends/fscommand.rs
+@@ -13,6 +13,14 @@ impl FsCommandProvider for DesktopFSCommandProvider {
+             "quit" => {
+                 let _ = self.event_loop.send_event(RuffleEvent::ExitRequested);
+             }
++            // PortMaster port: ask the launch script to restart Ruffle with `args` (it reads
++            // this line from stdout), so that each game starts in a fresh process.
++            "relaunch" => {
++                use std::io::Write;
++                println!("FPA_RELAUNCH {args}");
++                let _ = std::io::stdout().flush();
++                let _ = self.event_loop.send_event(RuffleEvent::ExitRequested);
++            }
+             "fullscreen" => {
+                 match args {
+                     "true" => {
+diff --git a/render/src/backend.rs b/render/src/backend.rs
+index 0200a467..0fea3de0 100644
+--- a/render/src/backend.rs
++++ b/render/src/backend.rs
+@@ -593,6 +593,10 @@ pub enum Context3DCommand<'a> {
+         texture: Option<Rc<dyn Texture>>,
+         cube: bool,
+     },
++    /// `TextureBase.dispose()`: release the texture's GPU memory now.
++    DisposeTexture {
++        texture: Rc<dyn Texture>,
++    },
+     SetColorMask {
+         red: bool,
+         green: bool,
+diff --git a/render/wgpu/src/context3d/current_pipeline.rs b/render/wgpu/src/context3d/current_pipeline.rs
+index 60c32fc4..c37a4311 100644
+--- a/render/wgpu/src/context3d/current_pipeline.rs
++++ b/render/wgpu/src/context3d/current_pipeline.rs
+@@ -51,7 +51,8 @@ impl IntoWgpu for Context3DStencilAction {
+     }
+ }
+ 
+-use std::cell::Cell;
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
+ use std::num::NonZeroU64;
+ use std::rc::Rc;
+ 
+@@ -125,6 +126,42 @@ pub struct CurrentPipeline {
+     // (which allows rendering with an 'ignoresampler' tex opcode,
+     // and no calls to Context3D.setSamplerStateAt)
+     sampler_configs: [SamplerConfig; 8],
++
++    // Pipelines and bind groups are expensive to create (on GLES, a pipeline means generating
++    // GLSL and linking a GL program), and Stage3D content switches between a small set of
++    // states every frame, so keep the ones we've built.
++    pipeline_cache: RefCell<HashMap<PipelineKey, CachedPipeline>>,
++    bind_group_cache: RefCell<HashMap<BindGroupKey, wgpu::BindGroup>>,
++}
++
++const MAX_CACHED_PIPELINES: usize = 256;
++const MAX_CACHED_BIND_GROUPS: usize = 1024;
++
++#[derive(Hash, PartialEq, Eq)]
++struct PipelineKey {
++    // Address of the `ShaderPairAgal`; the cached entry keeps it alive so the address stays unique.
++    shaders: usize,
++    compile_data: ShaderCompileData,
++    vertex_buffers: Vec<(u64, Vec<wgpu::VertexAttribute>)>,
++    cull_mode: Option<wgpu::Face>,
++    depth_stencil: Option<DepthStencilState>,
++    color_component: wgpu::BlendComponent,
++    alpha_component: wgpu::BlendComponent,
++    color_mask: wgpu::ColorWrites,
++    target_format: TextureFormat,
++    sample_count: u32,
++}
++
++struct CachedPipeline {
++    pipeline: wgpu::RenderPipeline,
++    bind_group_layout: wgpu::BindGroupLayout,
++    _shaders: Rc<ShaderPairAgal>,
++}
++
++#[derive(Hash, PartialEq, Eq)]
++struct BindGroupKey {
++    layout: wgpu::BindGroupLayout,
++    textures: [Option<(wgpu::TextureView, wgpu::Sampler)>; 8],
+ }
+ 
+ #[derive(Clone)]
+@@ -183,6 +220,9 @@ impl CurrentPipeline {
+             target_format: TextureFormat::Rgba8Unorm,
+ 
+             sampler_configs: [SamplerConfig::default(); 8],
++
++            pipeline_cache: RefCell::new(HashMap::new()),
++            bind_group_cache: RefCell::new(HashMap::new()),
+         }
+     }
+ 
+@@ -220,6 +260,11 @@ impl CurrentPipeline {
+         self.bound_textures[index] = texture;
+     }
+ 
++    /// Forget cached bind groups (they keep their textures alive).
++    pub fn forget_bind_groups(&self) {
++        self.bind_group_cache.borrow_mut().clear();
++    }
++
+     pub fn remove_texture(&mut self, texture: &Rc<dyn Texture>) {
+         for i in 0..self.bound_textures.len() {
+             if let Some(bound_texture) = &self.bound_textures[i] {
+@@ -399,31 +444,11 @@ impl CurrentPipeline {
+             }
+         }
+ 
+-        let compiled_shaders = self.shaders.as_ref().expect("Missing shaders!").compile(
+-            descriptors,
+-            ShaderCompileData {
+-                vertex_attributes: agal_attributes,
+-                texture_infos,
+-            },
+-        );
+-
+-        let pipeline_layout_label = create_debug_label!("Pipeline layout");
+-        let pipeline_layout =
+-            descriptors
+-                .device
+-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+-                    label: pipeline_layout_label.as_deref(),
+-                    bind_group_layouts: &[Some(&compiled_shaders.bind_group_layout)],
+-                    immediate_size: 0,
+-                });
+-
+-        let bind_group = descriptors
+-            .device
+-            .create_bind_group(&wgpu::BindGroupDescriptor {
+-                label: bind_group_label.as_deref(),
+-                layout: &compiled_shaders.bind_group_layout,
+-                entries: &bind_group_entries,
+-            });
++        let shaders = self.shaders.as_ref().expect("Missing shaders!");
++        let compile_data = ShaderCompileData {
++            vertex_attributes: agal_attributes,
++            texture_infos,
++        };
+ 
+         struct BufferData {
+             buffer: Rc<VertexBufferWrapper>,
+@@ -546,46 +571,120 @@ impl CurrentPipeline {
+             })
+             .collect::<Vec<_>>();
+ 
+-        let compiled = descriptors
+-            .device
+-            .create_render_pipeline(&RenderPipelineDescriptor {
+-                label: create_debug_label!("RenderPipeline").as_deref(),
+-                layout: Some(&pipeline_layout),
+-                vertex: VertexState {
+-                    module: &compiled_shaders.vertex_module,
+-                    entry_point: Some(naga_agal::SHADER_ENTRY_POINT),
+-                    buffers: &wgpu_vertex_buffers,
+-                    compilation_options: Default::default(),
+-                },
+-                fragment: Some(wgpu::FragmentState {
+-                    module: &compiled_shaders.fragment_module,
+-                    entry_point: Some(naga_agal::SHADER_ENTRY_POINT),
+-                    targets: &[Some(ColorTargetState {
+-                        format: self.target_format,
+-                        blend: Some(wgpu::BlendState {
+-                            color: self.color_component,
+-                            alpha: self.alpha_component,
+-                        }),
+-                        write_mask: self.color_mask,
+-                    })],
+-                    compilation_options: Default::default(),
+-                }),
+-                primitive: wgpu::PrimitiveState {
+-                    // Stage3d appears to use clockwise winding:
+-                    // https://stackoverflow.com/questions/8677498/stage3d-culling-confusion
+-                    front_face: FrontFace::Cw,
+-                    cull_mode,
+-                    ..Default::default()
+-                },
+-                depth_stencil,
+-                multisample: wgpu::MultisampleState {
+-                    count: self.sample_count,
+-                    mask: !0,
+-                    alpha_to_coverage_enabled: false,
+-                },
+-                multiview_mask: None,
+-                cache: None,
+-            });
++        let key = PipelineKey {
++            shaders: Rc::as_ptr(shaders) as usize,
++            compile_data: compile_data.clone(),
++            vertex_buffers: wgpu_vertex_buffers
++                .iter()
++                .flatten()
++                .map(|layout| (layout.array_stride, layout.attributes.to_vec()))
++                .collect(),
++            cull_mode,
++            depth_stencil: depth_stencil.clone(),
++            color_component: self.color_component,
++            alpha_component: self.alpha_component,
++            color_mask: self.color_mask,
++            target_format: self.target_format,
++            sample_count: self.sample_count,
++        };
++
++        let mut pipeline_cache = self.pipeline_cache.borrow_mut();
++        if pipeline_cache.len() >= MAX_CACHED_PIPELINES && !pipeline_cache.contains_key(&key) {
++            pipeline_cache.clear();
++        }
++        let cached = pipeline_cache.entry(key).or_insert_with(|| {
++            let compiled_shaders = shaders.compile(descriptors, compile_data);
++
++            let pipeline_layout_label = create_debug_label!("Pipeline layout");
++            let pipeline_layout =
++                descriptors
++                    .device
++                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                        label: pipeline_layout_label.as_deref(),
++                        bind_group_layouts: &[Some(&compiled_shaders.bind_group_layout)],
++                        immediate_size: 0,
++                    });
++
++            let pipeline = descriptors
++                .device
++                .create_render_pipeline(&RenderPipelineDescriptor {
++                    label: create_debug_label!("RenderPipeline").as_deref(),
++                    layout: Some(&pipeline_layout),
++                    vertex: VertexState {
++                        module: &compiled_shaders.vertex_module,
++                        entry_point: Some(naga_agal::SHADER_ENTRY_POINT),
++                        buffers: &wgpu_vertex_buffers,
++                        compilation_options: Default::default(),
++                    },
++                    fragment: Some(wgpu::FragmentState {
++                        module: &compiled_shaders.fragment_module,
++                        entry_point: Some(naga_agal::SHADER_ENTRY_POINT),
++                        targets: &[Some(ColorTargetState {
++                            format: self.target_format,
++                            blend: Some(wgpu::BlendState {
++                                color: self.color_component,
++                                alpha: self.alpha_component,
++                            }),
++                            write_mask: self.color_mask,
++                        })],
++                        compilation_options: Default::default(),
++                    }),
++                    primitive: wgpu::PrimitiveState {
++                        // Stage3d appears to use clockwise winding:
++                        // https://stackoverflow.com/questions/8677498/stage3d-culling-confusion
++                        front_face: FrontFace::Cw,
++                        cull_mode,
++                        ..Default::default()
++                    },
++                    depth_stencil,
++                    multisample: wgpu::MultisampleState {
++                        count: self.sample_count,
++                        mask: !0,
++                        alpha_to_coverage_enabled: false,
++                    },
++                    multiview_mask: None,
++                    cache: None,
++                });
++            CachedPipeline {
++                pipeline,
++                bind_group_layout: compiled_shaders.bind_group_layout.clone(),
++                _shaders: shaders.clone(),
++            }
++        });
++        let compiled = cached.pipeline.clone();
++        let bind_group_layout = cached.bind_group_layout.clone();
++        drop(pipeline_cache);
++
++        let mut textures: [Option<(wgpu::TextureView, wgpu::Sampler)>; 8] =
++            std::array::from_fn(|_| None);
++        for (i, bound_texture) in self.bound_textures.iter().enumerate() {
++            if let Some(bound_texture) = bound_texture {
++                textures[i] = Some((bound_texture.view.clone(), wgpu_samplers[i].clone()));
++            }
++        }
++        let bind_group_key = BindGroupKey {
++            layout: bind_group_layout.clone(),
++            textures,
++        };
++        let mut bind_group_cache = self.bind_group_cache.borrow_mut();
++        if bind_group_cache.len() >= MAX_CACHED_BIND_GROUPS
++            && !bind_group_cache.contains_key(&bind_group_key)
++        {
++            bind_group_cache.clear();
++        }
++        let bind_group = bind_group_cache
++            .entry(bind_group_key)
++            .or_insert_with(|| {
++                descriptors
++                    .device
++                    .create_bind_group(&wgpu::BindGroupDescriptor {
++                        label: bind_group_label.as_deref(),
++                        layout: &bind_group_layout,
++                        entries: &bind_group_entries,
++                    })
++            })
++            .clone();
++
+         Some((compiled, bind_group))
+     }
+ 
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index 588b6c64..ddad6da0 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -72,7 +72,10 @@ pub struct WgpuContext3D {
+ 
+     vertex_attributes: [Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
+ 
+-    buffer_command_encoder: CommandEncoder,
++    // Everything for the current frame (buffer copies and render passes, in order) is recorded
++    // into this one encoder and submitted at `present()`, instead of one submit per draw call.
++    // Per-draw submits are very expensive on mobile GLES drivers.
++    buffer_command_encoder: Option<CommandEncoder>,
+     // We may re-create `render_pass` multiple times while processing
+     // `commands`. If we do, then we only want to perform a clear if there
+     // was an explicit `Clear` command. Otherwise, we want to preserve the
+@@ -124,16 +127,9 @@ impl WgpuContext3D {
+         let front_buffer_raw_texture_handle = make_dummy_handle();
+ 
+         // FIXME - determine the best chunk size for this
+-        let buffer_staging_belt = StagingBelt::new(descriptors.device.clone(), 1024);
++        let buffer_staging_belt = StagingBelt::new(descriptors.device.clone(), 1 << 16);
+         let current_pipeline = CurrentPipeline::new(&descriptors);
+ 
+-        let buffer_command_encoder =
+-            descriptors
+-                .device
+-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+-                    label: create_debug_label!("Buffer command encoder").as_deref(),
+-                });
+-
+         Self {
+             profile,
+             descriptors,
+@@ -160,13 +156,22 @@ impl WgpuContext3D {
+             front_buffer_depth_texture_view: None,
+             front_buffer_resolve_texture_view: None,
+ 
+-            buffer_command_encoder,
++            buffer_command_encoder: None,
+             clear_color: None,
+             seen_clear_command: false,
+             scissor_rectangle: None,
+         }
+     }
+ 
++    /// Submits everything recorded for this frame.
++    fn flush(&mut self) {
++        if let Some(encoder) = self.buffer_command_encoder.take() {
++            self.buffer_staging_belt.finish();
++            self.descriptors.queue.submit([encoder.finish()]);
++            self.buffer_staging_belt.recall();
++        }
++    }
++
+     fn create_depth_texture(&self, width: u32, height: u32, sample_count: u32) -> TextureView {
+         self.descriptors
+             .device
+@@ -322,6 +327,8 @@ pub struct VertexBufferWrapper {
+ #[derive(Debug)]
+ pub struct TextureWrapper {
+     texture: wgpu::Texture,
++    /// Set by `TextureBase.dispose()`; the GPU texture has been destroyed.
++    disposed: Cell<bool>,
+ }
+ 
+ impl IndexBuffer for IndexBufferWrapper {}
+@@ -441,7 +448,10 @@ impl Context3D for WgpuContext3D {
+             view_formats: &[format],
+             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | render_attachment,
+         });
+-        Ok(Rc::new(TextureWrapper { texture }))
++        Ok(Rc::new(TextureWrapper {
++            texture,
++            disposed: Cell::new(false),
++        }))
+     }
+ 
+     fn create_cube_texture(
+@@ -479,7 +489,10 @@ impl Context3D for WgpuContext3D {
+                 | TextureUsages::COPY_DST
+                 | TextureUsages::RENDER_ATTACHMENT,
+         });
+-        Ok(Rc::new(TextureWrapper { texture }))
++        Ok(Rc::new(TextureWrapper {
++            texture,
++            disposed: Cell::new(false),
++        }))
+     }
+ 
+     fn upload_shaders(
+@@ -714,7 +727,7 @@ impl Context3D for WgpuContext3D {
+                 buffer.data[offset_bytes..(offset_bytes + data.len())].copy_from_slice(data);
+                 self.buffer_staging_belt
+                     .write_buffer(
+-                        &mut self.buffer_command_encoder,
++                        frame_encoder(&mut self.buffer_command_encoder, &self.descriptors.device),
+                         &buffer.buffer,
+                         rounded_down_offset as u64,
+                         NonZeroU64::new(rounded_up_length as u64).unwrap(),
+@@ -742,7 +755,7 @@ impl Context3D for WgpuContext3D {
+                 // offset and size will always be a multiple of `COPY_BUFFER_ALIGNMENT` (4 bytes)
+                 self.buffer_staging_belt
+                     .write_buffer(
+-                        &mut self.buffer_command_encoder,
++                        frame_encoder(&mut self.buffer_command_encoder, &self.descriptors.device),
+                         &buffer.buffer,
+                         (start_vertex * (data32_per_vertex as usize) * std::mem::size_of::<f32>())
+                             as u64,
+@@ -875,47 +888,35 @@ impl Context3D for WgpuContext3D {
+                     );
+                 }
+ 
+-                self.buffer_staging_belt.finish();
+-                let new_encoder = self.descriptors.device.create_command_encoder(
+-                    &wgpu::CommandEncoderDescriptor {
+-                        label: create_debug_label!("Buffer command encoder").as_deref(),
+-                    },
+-                );
+-                let finished_buffer_command_encoder =
+-                    std::mem::replace(&mut self.buffer_command_encoder, new_encoder);
+-
+-                // Note - we need to unconditionally re-create the render pass, since we had to submit the
+-                // buffer command encoder above.
+-
+                 if let Some((new_pipeline, new_bind_group)) = new_pipeline {
+                     self.compiled_pipeline = Some(new_pipeline);
+                     self.bind_group = Some(new_bind_group);
+                 }
+ 
+-                let mut render_command_encoder = self.descriptors.device.create_command_encoder(
+-                    &wgpu::CommandEncoderDescriptor {
+-                        label: create_debug_label!("Render command encoder").as_deref(),
+-                    },
+-                );
++                // The render pass goes into the frame encoder after any buffer copies recorded
++                // so far, so it sees them; later copies come after it.
++                let mut render_command_encoder = self
++                    .buffer_command_encoder
++                    .take()
++                    .unwrap_or_else(|| new_frame_encoder(&self.descriptors.device));
+ 
+-                let mut render_pass = self.make_render_pass(&mut render_command_encoder);
++                let exp = port_exp();
++                if exp != 2 {
++                    let mut render_pass = self.make_render_pass(&mut render_command_encoder);
+ 
+-                render_pass
+-                    .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
++                    render_pass
++                        .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
+ 
+-                if !unbound_required_textures {
+-                    render_pass.draw_indexed(indices, 0, 0..1);
+-                }
++                    if !unbound_required_textures && exp != 1 {
++                        render_pass.draw_indexed(indices, 0, 0..1);
++                    }
+ 
+-                // A `RenderPass` needs to hold references to several fields in `self`, so we can't
+-                // easily re-use it across multiple `DrawTriangles` calls.
+-                drop(render_pass);
++                    // A `RenderPass` needs to hold references to several fields in `self`, so we can't
++                    // easily re-use it across multiple `DrawTriangles` calls.
++                    drop(render_pass);
++                }
+ 
+-                self.descriptors.queue.submit([
+-                    finished_buffer_command_encoder.finish(),
+-                    render_command_encoder.finish(),
+-                ]);
+-                self.buffer_staging_belt.recall();
++                self.buffer_command_encoder = Some(render_command_encoder);
+             }
+ 
+             Context3DCommand::SetVertexBufferAt {
+@@ -964,7 +965,7 @@ impl Context3D for WgpuContext3D {
+                     * std::mem::size_of::<f32>() as u64;
+ 
+                 let mut buffer_view = self.buffer_staging_belt.write_buffer(
+-                    &mut self.buffer_command_encoder,
++                    frame_encoder(&mut self.buffer_command_encoder, &self.descriptors.device),
+                     buffer,
+                     offset,
+                     NonZeroU64::new(std::mem::size_of_val(matrix_raw_data_column_major) as u64)
+@@ -987,6 +988,9 @@ impl Context3D for WgpuContext3D {
+                 layer,
+             } => {
+                 let dest = Rc::<dyn Any>::downcast::<TextureWrapper>(dest).unwrap();
++                if dest.disposed.get() {
++                    return;
++                }
+ 
+                 // Unfortunately, we need to copy from the CPU data, rather than using the GPU texture.
+                 // The GPU side of a BitmapData can be updated at any time from non-Stage3D code.
+@@ -1039,7 +1043,8 @@ impl Context3D for WgpuContext3D {
+                 drop(texture_buffer_view);
+                 texture_buffer.unmap();
+ 
+-                self.buffer_command_encoder.copy_buffer_to_texture(
++                frame_encoder(&mut self.buffer_command_encoder, &self.descriptors.device)
++                    .copy_buffer_to_texture(
+                     wgpu::TexelCopyBufferInfo {
+                         buffer: &texture_buffer,
+                         // The copy source uses the padded image data, with larger rows
+@@ -1072,6 +1077,12 @@ impl Context3D for WgpuContext3D {
+                 texture,
+                 cube,
+             } => {
++                let texture = texture.filter(|texture| {
++                    !<dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref())
++                        .unwrap()
++                        .disposed
++                        .get()
++                });
+                 let bound_texture = if let Some(texture) = texture {
+                     let texture_wrapper =
+                         <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
+@@ -1094,6 +1105,19 @@ impl Context3D for WgpuContext3D {
+                 self.current_pipeline
+                     .update_texture_at(sampler as usize, bound_texture);
+             }
++            Context3DCommand::DisposeTexture { texture } => {
++                let wrapper = <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
++                if wrapper.disposed.replace(true) {
++                    return;
++                }
++                // Drop every reference we hold, submit pending work that may still use it,
++                // then free the memory right away (on shared-memory GPUs this is system RAM).
++                self.current_pipeline.remove_texture(&texture);
++                self.current_pipeline.forget_bind_groups();
++                self.bind_group = None;
++                self.flush();
++                wrapper.texture.destroy();
++            }
+             Context3DCommand::SetColorMask {
+                 red,
+                 green,
+@@ -1219,6 +1243,7 @@ impl Context3D for WgpuContext3D {
+ 
+     #[instrument(level = "debug", skip_all)]
+     fn present(&mut self) {
++        self.flush();
+         std::mem::swap(
+             &mut self.back_buffer_raw_texture_handle,
+             &mut self.front_buffer_raw_texture_handle,
+@@ -1284,3 +1309,22 @@ fn align_copy_buffer_size(len: usize) -> usize {
+     let align = COPY_BUFFER_ALIGNMENT as usize;
+     (len + align - 1) & !(align - 1)
+ }
++
++fn new_frame_encoder(device: &wgpu::Device) -> CommandEncoder {
++    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
++        label: create_debug_label!("Context3D frame encoder").as_deref(),
++    })
++}
++
++fn frame_encoder<'a>(
++    slot: &'a mut Option<CommandEncoder>,
++    device: &wgpu::Device,
++) -> &'a mut CommandEncoder {
++    slot.get_or_insert_with(|| new_frame_encoder(device))
++}
++
++// TEMP performance experiment: PORT_EXP=1 skips draw calls, 2 skips render passes entirely.
++fn port_exp() -> u32 {
++    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++    *V.get_or_init(|| std::env::var("PORT_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
++}
+diff --git a/render/wgpu/src/context3d/shader_pair.rs b/render/wgpu/src/context3d/shader_pair.rs
+index 761aea03..3e543ec4 100644
+--- a/render/wgpu/src/context3d/shader_pair.rs
++++ b/render/wgpu/src/context3d/shader_pair.rs
+@@ -41,7 +41,7 @@ impl ShaderPairAgal {
+             fragment_shader,
+             fragment_sampler_configs,
+             // TODO - figure out a good size for this cache.
+-            compiled: RefCell::new(LruCache::new(NonZeroUsize::new(2).unwrap())),
++            compiled: RefCell::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
+         })
+     }
+ 

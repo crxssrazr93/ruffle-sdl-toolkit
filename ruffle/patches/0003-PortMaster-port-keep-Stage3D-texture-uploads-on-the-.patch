@@ -1,0 +1,416 @@
+From 0bb25d2de38d01d5ed0785259e6964ea5b5889c9 Mon Sep 17 00:00:00 2001
+From: crxssrazr93 <crxssrazr93@gmail.com>
+Date: Sun, 4 Oct 2026 23:28:57 +0530
+Subject: [PATCH 03/14] PortMaster port: keep Stage3D texture uploads on the
+ GPU, texture dispose, AS3 profiler
+
+BitmapData drawn on the GPU is copied straight into Stage3D textures after the
+renderer submits its pending offscreen work, avoiding a GPU readback per upload.
+TextureBase.dispose frees GPU memory. RUFFLE_AS3_PROF=1 logs the hottest AS3 methods.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Kmv4BB92SbyvEePk3QGe8q
+---
+ core/src/avm2/function.rs                     | 94 +++++++++++++++++++
+ .../display3D/textures/rectangle_texture.rs   |  6 +-
+ .../flash/display3D/textures/texture.rs       | 33 ++++++-
+ core/src/avm2/method.rs                       |  7 ++
+ core/src/avm2/object/context3d_object.rs      | 20 ++++
+ core/src/bitmap/bitmap_data.rs                | 10 ++
+ render/src/backend.rs                         | 13 +++
+ render/wgpu/src/backend.rs                    |  4 +
+ render/wgpu/src/context3d/mod.rs              | 62 ++++++++----
+ 9 files changed, 221 insertions(+), 28 deletions(-)
+
+diff --git a/core/src/avm2/function.rs b/core/src/avm2/function.rs
+index f6a511ef..53930fb1 100644
+--- a/core/src/avm2/function.rs
++++ b/core/src/avm2/function.rs
+@@ -239,6 +239,28 @@ pub fn exec<'gc>(
+     user_arguments: FunctionArgs<'_, 'gc>,
+     activation: &mut Activation<'_, 'gc>,
+     callee: Option<FunctionObject<'gc>>,
++) -> Result<Value<'gc>, Error<'gc>> {
++    if !as3prof::enabled() {
++        return exec_inner(method, scope, receiver, bound_superclass, user_arguments, activation, callee);
++    }
++    as3prof::enter(method.ptr_id(), || {
++        let mut name = WString::new();
++        display_function(&mut name, method);
++        name.to_string()
++    });
++    let ret = exec_inner(method, scope, receiver, bound_superclass, user_arguments, activation, callee);
++    as3prof::leave();
++    ret
++}
++
++fn exec_inner<'gc>(
++    method: Method<'gc>,
++    scope: ScopeChain<'gc>,
++    receiver: Value<'gc>,
++    bound_superclass: Option<ClassObject<'gc>>,
++    user_arguments: FunctionArgs<'_, 'gc>,
++    activation: &mut Activation<'_, 'gc>,
++    callee: Option<FunctionObject<'gc>>,
+ ) -> Result<Value<'gc>, Error<'gc>> {
+     let mc = activation.gc();
+ 
+@@ -446,3 +468,75 @@ pub fn display_function<'gc>(output: &mut WString, method: Method<'gc>) {
+ 
+     output.push_utf8("()");
+ }
++
++/// Opt-in ActionScript 3 profiler for the PortMaster port (RUFFLE_AS3_PROF=1): every five seconds
++/// logs the methods with the most exclusive (self) time.
++mod as3prof {
++    use std::cell::RefCell;
++    use std::collections::HashMap;
++    use std::sync::OnceLock;
++    use std::time::{Duration, Instant};
++
++    pub fn enabled() -> bool {
++        static ENABLED: OnceLock<bool> = OnceLock::new();
++        *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_AS3_PROF").is_some())
++    }
++
++    #[derive(Default)]
++    struct Prof {
++        stack: Vec<(usize, Instant, Duration)>,
++        stats: HashMap<usize, (String, Duration, Duration, u64)>,
++        last_dump: Option<Instant>,
++    }
++
++    thread_local! {
++        static PROF: RefCell<Prof> = RefCell::new(Prof::default());
++    }
++
++    pub fn enter(id: usize, name: impl FnOnce() -> String) {
++        PROF.with_borrow_mut(|p| {
++            p.stats
++                .entry(id)
++                .or_insert_with(|| (name(), Duration::ZERO, Duration::ZERO, 0));
++            p.stack.push((id, Instant::now(), Duration::ZERO));
++        });
++    }
++
++    pub fn leave() {
++        PROF.with_borrow_mut(|p| {
++            let Some((id, start, children)) = p.stack.pop() else { return };
++            let total = start.elapsed();
++            if let Some(entry) = p.stats.get_mut(&id) {
++                entry.1 += total.saturating_sub(children);
++                entry.2 += total;
++                entry.3 += 1;
++            }
++            if let Some(parent) = p.stack.last_mut() {
++                parent.2 += total;
++            }
++            let now = Instant::now();
++            let last = *p.last_dump.get_or_insert(now);
++            if p.stack.is_empty() && now - last >= Duration::from_secs(5) {
++                let mut rows: Vec<_> = p.stats.values().filter(|r| r.3 > 0).collect();
++                rows.sort_by(|a, b| b.1.cmp(&a.1));
++                let mut out = String::from("as3prof (self ms / total ms / calls over 5 s):");
++                for (name, own, incl, calls) in rows.iter().take(45) {
++                    out.push_str(&format!(
++                        "\n  {:8.1} {:8.1} {:7} {}",
++                        own.as_secs_f64() * 1000.0,
++                        incl.as_secs_f64() * 1000.0,
++                        calls,
++                        name
++                    ));
++                }
++                tracing::info!("{out}");
++                for row in p.stats.values_mut() {
++                    row.1 = Duration::ZERO;
++                    row.2 = Duration::ZERO;
++                    row.3 = 0;
++                }
++                p.last_dump = Some(now);
++            }
++        });
++    }
++}
+diff --git a/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs b/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
+index e726831c..f4cebb67 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
++++ b/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
+@@ -32,11 +32,7 @@ pub fn upload_from_bitmap_data<'gc>(
+         let source_obj = args.get_object(activation, 0, "source")?;
+ 
+         if let Some(source) = source_obj.as_bitmap_data() {
+-            texture.context3d().copy_bitmapdata_to_texture(
+-                &source.sync(activation.context.renderer).borrow(),
+-                texture.handle(),
+-                0,
+-            );
++            super::texture::upload_bitmap_data(activation, texture, source);
+         } else {
+             unreachable!("Argument is BitmapData-typed");
+         }
+diff --git a/core/src/avm2/globals/flash/display3D/textures/texture.rs b/core/src/avm2/globals/flash/display3D/textures/texture.rs
+index 3e515f5f..870390c5 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/texture.rs
++++ b/core/src/avm2/globals/flash/display3D/textures/texture.rs
+@@ -126,11 +126,7 @@ pub fn upload_from_bitmap_data<'gc>(
+         if let Some(source) = source_obj.as_bitmap_data() {
+             let mip_level = args.get_u32(1);
+             if mip_level == 0 {
+-                texture.context3d().copy_bitmapdata_to_texture(
+-                    &source.sync(activation.context.renderer).borrow(),
+-                    texture.handle(),
+-                    0,
+-                );
++                upload_bitmap_data(activation, texture, source);
+             } else {
+                 avm2_stub_method!(
+                     activation,
+@@ -145,3 +141,30 @@ pub fn upload_from_bitmap_data<'gc>(
+     }
+     Ok(Value::Undefined)
+ }
++
++/// Uploads a BitmapData (mip level 0). When its newest pixels are on the GPU (e.g. right after
++/// `BitmapData.draw`), copy GPU-side instead of reading them back to the CPU first.
++pub(super) fn upload_bitmap_data<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    texture: crate::avm2::object::TextureObject<'gc>,
++    source: crate::bitmap::bitmap_data::BitmapData<'gc>,
++) {
++    let dest = texture.handle();
++    if source.is_gpu_modified()
++        && source.width() <= dest.width()
++        && source.height() <= dest.height()
++    {
++        let (width, height) = (source.width(), source.height());
++        let handle = source.bitmap_handle(activation.gc(), activation.context.renderer);
++        activation.context.renderer.flush_pending_gpu_work();
++        texture
++            .context3d()
++            .copy_bitmap_handle_to_texture(handle, width, height, dest, 0);
++    } else {
++        texture.context3d().copy_bitmapdata_to_texture(
++            &source.sync(activation.context.renderer).borrow(),
++            dest,
++            0,
++        );
++    }
++}
+diff --git a/core/src/avm2/method.rs b/core/src/avm2/method.rs
+index 4363024d..a871e130 100644
+--- a/core/src/avm2/method.rs
++++ b/core/src/avm2/method.rs
+@@ -98,6 +98,13 @@ impl<'gc> ParamConfig<'gc> {
+ #[collect(no_drop)]
+ pub struct Method<'gc>(Gc<'gc, MethodData<'gc>>);
+ 
++impl Method<'_> {
++    /// Identity of this method (for the port's AS3 profiler).
++    pub fn ptr_id(self) -> usize {
++        Gc::as_ptr(self.0) as usize
++    }
++}
++
+ #[derive(Collect)]
+ #[collect(no_drop)]
+ struct MethodData<'gc> {
+diff --git a/core/src/avm2/object/context3d_object.rs b/core/src/avm2/object/context3d_object.rs
+index 7e85dae7..e0c94ea5 100644
+--- a/core/src/avm2/object/context3d_object.rs
++++ b/core/src/avm2/object/context3d_object.rs
+@@ -16,6 +16,7 @@ use ruffle_render::backend::{
+     Context3DStencilAction, Context3DTextureFormat, Context3DTriangleFace,
+     Context3DVertexBufferFormat, ProgramType, Texture,
+ };
++use ruffle_render::bitmap::BitmapHandle;
+ use ruffle_render::commands::CommandHandler;
+ use ruffle_render::matrix::Matrix;
+ use std::cell::Cell;
+@@ -387,6 +388,25 @@ impl<'gc> Context3DObject<'gc> {
+         });
+     }
+ 
++    pub(crate) fn copy_bitmap_handle_to_texture(
++        self,
++        source: BitmapHandle,
++        source_width: u32,
++        source_height: u32,
++        dest: Rc<dyn Texture>,
++        layer: u32,
++    ) {
++        self.with_context_3d(|ctx| {
++            ctx.process_command(Context3DCommand::CopyBitmapHandleToTexture {
++                source,
++                source_width,
++                source_height,
++                dest,
++                layer,
++            })
++        });
++    }
++
+     pub(crate) fn dispose_texture(self, texture: Rc<dyn Texture>) {
+         self.with_context_3d(|ctx| ctx.process_command(Context3DCommand::DisposeTexture { texture }));
+     }
+diff --git a/core/src/bitmap/bitmap_data.rs b/core/src/bitmap/bitmap_data.rs
+index 851671aa..5939b738 100644
+--- a/core/src/bitmap/bitmap_data.rs
++++ b/core/src/bitmap/bitmap_data.rs
+@@ -270,6 +270,11 @@ impl<'gc> BitmapData<'gc> {
+         self.0.sync(renderer)
+     }
+ 
++    /// Whether the newest pixels are on the GPU (and the CPU copy is stale).
++    pub fn is_gpu_modified(&self) -> bool {
++        self.0.is_gpu_modified()
++    }
++
+     pub fn bitmap_handle(
+         &self,
+         gc_context: &Mutation<'gc>,
+@@ -604,6 +609,11 @@ mod wrapper {
+         // CPU-side pixels. They are implemented directly on `BitmapRawDataWrapper`, allowing
+         // callers to avoid calling sync()
+ 
++        /// Whether the newest pixels are on the GPU (and the CPU copy is stale).
++        pub fn is_gpu_modified(&self) -> bool {
++            matches!(self.0.borrow().dirty_state, DirtyState::GpuModified(..))
++        }
++
+         pub fn height(&self) -> u32 {
+             self.0.borrow().height
+         }
+diff --git a/render/src/backend.rs b/render/src/backend.rs
+index 0fea3de0..3af9acf9 100644
+--- a/render/src/backend.rs
++++ b/render/src/backend.rs
+@@ -46,6 +46,10 @@ pub trait RenderBackend: Any {
+         self.register_shape(shape, bitmap_source)
+     }
+ 
++    /// Submits any GPU work recorded so far (offscreen draws) so that later work on other
++    /// encoders, such as Stage3D copies, sees its results.
++    fn flush_pending_gpu_work(&mut self) {}
++
+     fn render_offscreen(
+         &mut self,
+         handle: BitmapHandle,
+@@ -593,6 +597,15 @@ pub enum Context3DCommand<'a> {
+         texture: Option<Rc<dyn Texture>>,
+         cube: bool,
+     },
++    /// Like `CopyBitmapToTexture`, but from a BitmapData whose newest pixels are on the GPU,
++    /// avoiding a GPU -> CPU readback.
++    CopyBitmapHandleToTexture {
++        source: BitmapHandle,
++        source_width: u32,
++        source_height: u32,
++        dest: Rc<dyn Texture>,
++        layer: u32,
++    },
+     /// `TextureBase.dispose()`: release the texture's GPU memory now.
+     DisposeTexture {
+         texture: Rc<dyn Texture>,
+diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
+index 5dcf43c0..b450481d 100644
+--- a/render/wgpu/src/backend.rs
++++ b/render/wgpu/src/backend.rs
+@@ -788,6 +788,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+     }
+ 
+     #[instrument(level = "debug", skip_all)]
++    fn flush_pending_gpu_work(&mut self) {
++        self.active_frame.submit_direct(&self.descriptors);
++    }
++
+     fn render_offscreen(
+         &mut self,
+         handle: BitmapHandle,
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index ddad6da0..60fff3c8 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -900,22 +900,19 @@ impl Context3D for WgpuContext3D {
+                     .take()
+                     .unwrap_or_else(|| new_frame_encoder(&self.descriptors.device));
+ 
+-                let exp = port_exp();
+-                if exp != 2 {
+-                    let mut render_pass = self.make_render_pass(&mut render_command_encoder);
++                let mut render_pass = self.make_render_pass(&mut render_command_encoder);
+ 
+-                    render_pass
+-                        .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
++                render_pass
++                    .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
+ 
+-                    if !unbound_required_textures && exp != 1 {
+-                        render_pass.draw_indexed(indices, 0, 0..1);
+-                    }
+-
+-                    // A `RenderPass` needs to hold references to several fields in `self`, so we can't
+-                    // easily re-use it across multiple `DrawTriangles` calls.
+-                    drop(render_pass);
++                if !unbound_required_textures {
++                    render_pass.draw_indexed(indices, 0, 0..1);
+                 }
+ 
++                // A `RenderPass` needs to hold references to several fields in `self`, so we can't
++                // easily re-use it across multiple `DrawTriangles` calls.
++                drop(render_pass);
++
+                 self.buffer_command_encoder = Some(render_command_encoder);
+             }
+ 
+@@ -1105,6 +1102,41 @@ impl Context3D for WgpuContext3D {
+                 self.current_pipeline
+                     .update_texture_at(sampler as usize, bound_texture);
+             }
++            Context3DCommand::CopyBitmapHandleToTexture {
++                source,
++                source_width,
++                source_height,
++                dest,
++                layer,
++            } => {
++                let dest = Rc::<dyn Any>::downcast::<TextureWrapper>(dest).unwrap();
++                if dest.disposed.get() {
++                    return;
++                }
++                let source = crate::as_texture(&source);
++                frame_encoder(&mut self.buffer_command_encoder, &self.descriptors.device)
++                    .copy_texture_to_texture(
++                        source.texture.as_image_copy(),
++                        wgpu::TexelCopyTextureInfo {
++                            texture: &dest.texture,
++                            mip_level: 0,
++                            origin: wgpu::Origin3d {
++                                x: 0,
++                                y: 0,
++                                z: layer,
++                            },
++                            aspect: wgpu::TextureAspect::All,
++                        },
++                        wgpu::Extent3d {
++                            width: source_width,
++                            height: source_height,
++                            depth_or_array_layers: 1,
++                        },
++                    );
++                // Submit now, so the copy sees the bitmap as it is at this point (the main
++                // renderer may draw into it again before our next present).
++                self.flush();
++            }
+             Context3DCommand::DisposeTexture { texture } => {
+                 let wrapper = <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
+                 if wrapper.disposed.replace(true) {
+@@ -1322,9 +1354,3 @@ fn frame_encoder<'a>(
+ ) -> &'a mut CommandEncoder {
+     slot.get_or_insert_with(|| new_frame_encoder(device))
+ }
+-
+-// TEMP performance experiment: PORT_EXP=1 skips draw calls, 2 skips render passes entirely.
+-fn port_exp() -> u32 {
+-    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+-    *V.get_or_init(|| std::env::var("PORT_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+-}

@@ -1,0 +1,280 @@
+From b68a50c4d73cd378bd2c8dd029bc6c5c7297846b Mon Sep 17 00:00:00 2001
+From: crxssrazr93 <crxssrazr93@gmail.com>
+Date: Sun, 4 Oct 2026 22:57:40 +0530
+Subject: [PATCH 01/14] avm2: implement Graphics.readGraphicsData
+
+---
+ .../avm2/globals/flash/display/graphics.rs    | 149 +++++++++++++++++-
+ core/src/display_object/graphic.rs            |   9 ++
+ core/src/drawing.rs                           |  49 ++++++
+ 3 files changed, 203 insertions(+), 4 deletions(-)
+
+diff --git a/core/src/avm2/globals/flash/display/graphics.rs b/core/src/avm2/globals/flash/display/graphics.rs
+index 7770dba8..99202436 100644
+--- a/core/src/avm2/globals/flash/display/graphics.rs
++++ b/core/src/avm2/globals/flash/display/graphics.rs
+@@ -17,7 +17,8 @@ use crate::avm2::vector::VectorStorage;
+ use crate::avm2::{ArrayStorage, Error};
+ use crate::avm2_stub_method;
+ use crate::display_object::TDisplayObject;
+-use crate::drawing::Drawing;
++use crate::display_object::DisplayObject;
++use crate::drawing::{Drawing, DrawingDataPath};
+ use crate::string::{AvmString, WStr};
+ use either::Either;
+ use ruffle_render::shape_utils::{DrawCommand, FillRule, GradientType};
+@@ -1354,17 +1355,157 @@ pub fn line_bitmap_style<'gc>(
+ }
+ 
+ /// Implements `Graphics.readGraphicsData`
++///
++/// Emits `GraphicsSolidFill, GraphicsPath, GraphicsEndFill` for each solid fill and
++/// `GraphicsStroke, GraphicsPath, GraphicsStroke(NaN)` for each stroke, in drawing order.
++/// Gradient and bitmap fills are not exported yet. `recurse` is ignored (children aren't
++/// included).
+ pub fn read_graphics_data<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+-    _this: Value<'gc>,
++    this: Value<'gc>,
+     _args: FunctionArgs<'_, 'gc>,
+ ) -> Result<Value<'gc>, Error<'gc>> {
+-    avm2_stub_method!(activation, "flash.display.Graphics", "readGraphicsData");
+     let value_type = activation.avm2().class_defs().igraphicsdata;
+-    let new_storage = VectorStorage::new(0, false, Some(value_type));
++    let this = this.as_object().unwrap();
++
++    let drawing = match this.as_display_object() {
++        Some(DisplayObject::Graphic(graphic)) => Some(graphic.drawing_snapshot()),
++        Some(dobj) => dobj.as_drawing().map(|drawing| drawing.clone()),
++        None => None,
++    };
++
++    let mut items = Vec::new();
++    if let Some(drawing) = drawing {
++        for path in drawing.data_paths() {
++            match path {
++                DrawingDataPath::Fill {
++                    style: FillStyle::Color(color),
++                    rule,
++                    commands,
++                } => {
++                    items.push(new_solid_fill(activation, color)?);
++                    items.push(new_graphics_path(activation, commands, rule)?);
++                    let end_fill = activation.avm2().class_defs().graphicsendfill;
++                    items.push(construct_def(activation, end_fill, &[])?);
++                }
++                DrawingDataPath::Fill { .. } => {
++                    avm2_stub_method!(
++                        activation,
++                        "flash.display.Graphics",
++                        "readGraphicsData",
++                        "with gradient or bitmap fills"
++                    );
++                }
++                DrawingDataPath::Line { style, commands } => {
++                    let fill = match style.fill_style() {
++                        FillStyle::Color(color) => new_solid_fill(activation, color)?,
++                        _ => Value::Null,
++                    };
++                    let caps = match style.start_cap() {
++                        LineCapStyle::None => "none",
++                        LineCapStyle::Square => "square",
++                        LineCapStyle::Round => "round",
++                    };
++                    let (joints, miter) = match style.join_style() {
++                        LineJoinStyle::Round => ("round", 3.0),
++                        LineJoinStyle::Bevel => ("bevel", 3.0),
++                        LineJoinStyle::Miter(limit) => ("miter", limit.to_f64()),
++                    };
++                    let args = [
++                        style.width().to_pixels().into(),
++                        style.is_pixel_hinted().into(),
++                        AvmString::new_utf8(activation.gc(), "normal").into(),
++                        AvmString::new_utf8(activation.gc(), caps).into(),
++                        AvmString::new_utf8(activation.gc(), joints).into(),
++                        miter.into(),
++                        fill,
++                    ];
++                    let stroke_class = activation.avm2().class_defs().graphicsstroke;
++                    items.push(construct_def(activation, stroke_class, &args)?);
++                    items.push(new_graphics_path(activation, commands, FillRule::NonZero)?);
++                    items.push(construct_def(activation, stroke_class, &[])?);
++                }
++            }
++        }
++    }
++
++    let new_storage = VectorStorage::from_values(items, false, Some(value_type));
+     Ok(VectorObject::from_vector(new_storage, activation).into())
+ }
+ 
++fn construct_def<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class: crate::avm2::Class<'gc>,
++    args: &[Value<'gc>],
++) -> Result<Value<'gc>, Error<'gc>> {
++    let class_object = class
++        .class_object()
++        .expect("flash.display graphics data classes have a class object");
++    class_object.construct(activation, args)
++}
++
++fn new_solid_fill<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    color: &Color,
++) -> Result<Value<'gc>, Error<'gc>> {
++    let rgb = ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32;
++    let alpha = color.a as f64 / 255.0;
++    let class = activation.avm2().class_defs().graphicssolidfill;
++    construct_def(activation, class, &[rgb.into(), alpha.into()])
++}
++
++fn new_graphics_path<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    commands: &[DrawCommand],
++    rule: FillRule,
++) -> Result<Value<'gc>, Error<'gc>> {
++    let mut cmds: Vec<Value<'gc>> = Vec::with_capacity(commands.len());
++    let mut data: Vec<Value<'gc>> = Vec::with_capacity(commands.len() * 2);
++    let push = |data: &mut Vec<Value<'gc>>, p: &swf::Point<Twips>| {
++        data.push(p.x.to_pixels().into());
++        data.push(p.y.to_pixels().into());
++    };
++    for command in commands {
++        match command {
++            DrawCommand::MoveTo(p) => {
++                cmds.push(1.into());
++                push(&mut data, p);
++            }
++            DrawCommand::LineTo(p) => {
++                cmds.push(2.into());
++                push(&mut data, p);
++            }
++            DrawCommand::QuadraticCurveTo { control, anchor } => {
++                cmds.push(3.into());
++                push(&mut data, control);
++                push(&mut data, anchor);
++            }
++            DrawCommand::CubicCurveTo {
++                control_a,
++                control_b,
++                anchor,
++            } => {
++                cmds.push(6.into());
++                push(&mut data, control_a);
++                push(&mut data, control_b);
++                push(&mut data, anchor);
++            }
++        }
++    }
++    let class_defs = activation.avm2().class_defs();
++    let cmds = VectorStorage::from_values(cmds, false, Some(class_defs.int));
++    let data = VectorStorage::from_values(data, false, Some(class_defs.number));
++    let cmds = VectorObject::from_vector(cmds, activation);
++    let data = VectorObject::from_vector(data, activation);
++    let winding = match rule {
++        FillRule::NonZero => "nonZero",
++        FillRule::EvenOdd => "evenOdd",
++    };
++    let winding = AvmString::new_utf8(activation.gc(), winding);
++    let class = activation.avm2().class_defs().graphicspath;
++    construct_def(activation, class, &[cmds.into(), data.into(), winding.into()])
++}
++
+ fn read_point<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+     data: &VectorStorage<'gc>,
+diff --git a/core/src/display_object/graphic.rs b/core/src/display_object/graphic.rs
+index 8b139136..b566e996 100644
+--- a/core/src/display_object/graphic.rs
++++ b/core/src/display_object/graphic.rs
+@@ -123,6 +123,15 @@ impl<'gc> Graphic<'gc> {
+         self.0.drawing.get_or_init(Default::default).borrow_mut()
+     }
+ 
++    /// The shape's current vector content. Unlike `drawing_mut`, this doesn't replace the
++    /// timeline shape with an empty dynamic drawing when nothing was drawn yet.
++    pub fn drawing_snapshot(&self) -> Drawing {
++        match self.0.drawing.get() {
++            Some(drawing) => drawing.borrow().clone(),
++            None => Drawing::from_swf_shape(&self.0.shared.get().shape),
++        }
++    }
++
+     pub fn set_avm2_class(self, mc: &Mutation<'gc>, class: Avm2ClassObject<'gc>) {
+         unlock!(Gc::write(mc, self.0), GraphicData, class).set(Some(class));
+     }
+diff --git a/core/src/drawing.rs b/core/src/drawing.rs
+index f3dc5bd0..f9437b5d 100644
+--- a/core/src/drawing.rs
++++ b/core/src/drawing.rs
+@@ -104,6 +104,23 @@ impl Drawing {
+         this
+     }
+ 
++    /// Read-only view of the drawing's fill and stroke paths, in drawing order
++    /// (used by `Graphics.readGraphicsData`).
++    pub fn data_paths(&self) -> Vec<DrawingDataPath<'_>> {
++        let mut out: Vec<DrawingDataPath<'_>> = self
++            .paths
++            .iter()
++            .map(|path| match path {
++                DrawingPath::Fill(f) => f.data_path(),
++                DrawingPath::Line(l) => l.data_path(),
++            })
++            .collect();
++        out.extend(self.current_fill.iter().map(DrawingFill::data_path));
++        out.extend(self.pending_lines.iter().map(DrawingLine::data_path));
++        out.extend(self.current_line.iter().map(DrawingLine::data_path));
++        out
++    }
++
+     fn mark_dirty(&mut self) {
+         self.is_empty = false;
+         self.render_handle.take();
+@@ -433,6 +450,19 @@ impl BitmapSource for Drawing {
+     }
+ }
+ 
++/// A fill or stroke path of a [`Drawing`], as exposed by [`Drawing::data_paths`].
++pub enum DrawingDataPath<'a> {
++    Fill {
++        style: &'a FillStyle,
++        rule: FillRule,
++        commands: &'a [DrawCommand],
++    },
++    Line {
++        style: &'a LineStyle,
++        commands: &'a [DrawCommand],
++    },
++}
++
+ #[derive(Debug, Clone)]
+ struct DrawingFill {
+     style: FillStyle,
+@@ -447,6 +477,25 @@ struct DrawingLine {
+     is_closed: bool,
+ }
+ 
++impl DrawingFill {
++    fn data_path(&self) -> DrawingDataPath<'_> {
++        DrawingDataPath::Fill {
++            style: &self.style,
++            rule: self.rule,
++            commands: &self.commands,
++        }
++    }
++}
++
++impl DrawingLine {
++    fn data_path(&self) -> DrawingDataPath<'_> {
++        DrawingDataPath::Line {
++            style: &self.style,
++            commands: &self.commands,
++        }
++    }
++}
++
+ #[derive(Debug, Clone)]
+ enum DrawingPath {
+     Fill(DrawingFill),

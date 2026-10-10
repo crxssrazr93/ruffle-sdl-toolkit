@@ -1,0 +1,55 @@
+From 3b79f1a03e7e1b87a9499a6e3557b7591b4a0d2f Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 08:36:24 -0400
+Subject: [PATCH 05/14] core: Player::add_gc_work and
+ Player::collect_garbage_now
+
+Two small hooks for front ends that run in little memory (ruffle_sdl on 1 GB
+handhelds).
+
+gc-arena paces the incremental collector by the size of the gc objects
+themselves. The buffers those objects own (strings, arrays, XML, bitmap
+pixels) are not counted, so a game that churns through them keeps hundreds of
+MB of garbage alive for a long time. add_gc_work(fraction) adds a fraction of
+a full cycle of collector work on top of what allocations pay for; a 1% push
+per tick keeps the heap near its live size at no visible frame cost.
+
+collect_garbage_now() finishes the current cycle at once. A front end can call
+it right after a tick that took very long (a level or world load), which
+builds and drops a lot of temporary objects in one go.
+
+Neither is called by Ruffle itself, so nothing changes for the existing front
+ends.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/src/player.rs | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/core/src/player.rs b/core/src/player.rs
+index e64d57ed..76ddac6b 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2463,6 +2463,22 @@ impl Player {
+         rval
+     }
+ 
++    /// Runs the collector to the end of a cycle now (frees everything unreachable at once).
++    pub fn collect_garbage_now(&mut self) {
++        self.gc_arena.borrow_mut().finish_cycle();
++    }
++
++    /// Makes the incremental collector do extra work: `fraction` of a full cycle (of the live
++    /// heap) on top of what allocations pay for. gc-arena only counts the size of the objects
++    /// themselves, not the buffers they own (strings, XML, arrays), so a game that churns those
++    /// gets collected far too slowly; a small push every frame keeps the heap near its live size.
++    pub fn add_gc_work(&mut self, fraction: f64) {
++        let arena = self.gc_arena.borrow();
++        let metrics = arena.metrics();
++        // A full cycle costs about (mark + trace + keep) work per live object (gc-arena Pacing)
++        metrics.adjust_debt(fraction * metrics.total_gc_count() as f64 * 0.55);
++    }
++
+     pub fn flush_shared_objects(&mut self) {
+         self.update(|context| {
+             if let Some(mut avm1_activation) =

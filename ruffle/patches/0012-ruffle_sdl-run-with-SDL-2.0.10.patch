@@ -1,0 +1,33 @@
+From d8e446471b03b8728923f82f87530d5607e01aa8 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 11:03:31 -0400
+Subject: [PATCH 12/14] ruffle_sdl: run with SDL 2.0.10
+
+The sdl2 crate references SDL_Metal_DestroyView (SDL 2.0.12+, macOS Metal views), which ruffle_sdl never
+calls. Linked with immediate binding, that one missing symbol kept the binary from starting on SDL 2.0.10
+(Ubuntu 20.04, older firmwares); it is the only one of ruffle_sdl's 26 SDL imports that 2.0.10 lacks.
+ruffle_sdl now defines it as a no-op, so it links and runs against SDL 2.0.10 and newer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sdl/src/main.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index 60b52912..b2148558 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -283,6 +283,13 @@ impl FsCommandProvider for FsCommands {
+     }
+ }
+ 
++/// SDL 2.0.10 compatibility: the sdl2 crate links `SDL_Metal_DestroyView` (added in SDL 2.0.12, macOS
++/// only), which ruffle_sdl never calls. Defining it here lets the binary link and start against SDL 2.0.10
++/// (Ubuntu 20.04, older firmwares); with a newer SDL this definition is used instead of the library's
++/// no-op Linux one, which changes nothing.
++#[unsafe(no_mangle)]
++pub extern "C" fn SDL_Metal_DestroyView(_view: *mut std::ffi::c_void) {}
++
+ fn main() -> anyhow::Result<()> {
+     tracing_subscriber::fmt()
+         .with_env_filter(

@@ -1,0 +1,1135 @@
+From bef2a3a881b3e952426459803e50c433da2f0195 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Wed, 7 Oct 2026 09:14:53 -0400
+Subject: [PATCH 10/14] Memory accounting by category (RUFFLE_MEMLOG), sampled
+ by ruffle_sdl
+
+The tool that found where World 2 of Fancy Pants Adventures spent its 800
+MB, kept so the next memory problem on a handheld can be measured the same
+way. Off by default: a disabled tag is an inert value and costs one branch.
+
+* ruffle_render::memlog: a Tag adds its size to a category while it lives
+  and keeps a short description of the item. Categories: BitmapData CPU
+  pixels, BitmapData textures, SWF bitmap textures, cacheAsBitmap textures,
+  pooled render targets, shape meshes (split into those first tessellated
+  inside BitmapData.draw and the rest), sounds copied into the mixer, the
+  uncompressed SWF, and library data kept for the life of the movie (parsed
+  shape records, compressed bitmaps). A thread-local context ("bitmapdata",
+  "bitmapdata.draw") tells the wgpu backend who asked for a texture or mesh.
+  GPU to CPU readbacks are counted too.
+* Hooks: BitmapRawData pixels, wgpu Texture (register_bitmap,
+  create_empty_texture), the texture pool, Mesh, mixer sounds, bitmap
+  characters, shape records, SwfMovie (logs its size once).
+* ruffle_sdl: with RUFFLE_MEMLOG=1 a thread samples VmRSS, RssAnon and
+  RssFile every RUFFLE_MEMLOG_MS (100) ms and logs once a second (target
+  memlog, so RUST_LOG needs memlog=info) the highest sample with the
+  category totals, the C heap use and the gc object count
+  (Player::gc_count). At every new RSS peak the biggest items of each
+  category (RUFFLE_MEMLOG_TOP, 8) are written to the file RUFFLE_MEMLOG_PEAK,
+  or logged. The C heap figures come from mallinfo2, looked up at run time
+  with dlsym because the handhelds have glibc older than 2.33; mallinfo is
+  the fallback.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/common/src/tag_utils.rs       |   7 +
+ core/src/backend/audio/mixer.rs    |  12 ++
+ core/src/bitmap/bitmap_data.rs     |  40 +++-
+ core/src/bitmap/operations.rs      |   1 +
+ core/src/character.rs              |  13 ++
+ core/src/display_object/graphic.rs |  23 +-
+ core/src/player.rs                 |   5 +
+ render/src/lib.rs                  |   1 +
+ render/src/memlog.rs               | 323 +++++++++++++++++++++++++++++
+ render/wgpu/src/backend.rs         |  70 ++++++-
+ render/wgpu/src/buffer_pool.rs     |  36 +++-
+ render/wgpu/src/context3d/mod.rs   |   5 +
+ render/wgpu/src/lib.rs             |   3 +
+ render/wgpu/src/mesh.rs            |   6 +
+ render/wgpu/src/pixel_bender.rs    |   1 +
+ render/wgpu/src/surface/target.rs  |   8 +-
+ sdl/src/main.rs                    | 159 ++++++++++++++
+ 17 files changed, 703 insertions(+), 10 deletions(-)
+ create mode 100644 render/src/memlog.rs
+
+diff --git a/core/common/src/tag_utils.rs b/core/common/src/tag_utils.rs
+index d5bef6e1..226244e0 100644
+--- a/core/common/src/tag_utils.rs
++++ b/core/common/src/tag_utils.rs
+@@ -172,6 +172,13 @@ impl SwfMovie {
+     ) -> Result<Self, swf::error::Error> {
+         let compressed_len = swf_data.len();
+         let swf_buf = swf::read::decompress_swf(swf_data)?;
++        if std::env::var_os("RUFFLE_MEMLOG").is_some() {
++            tracing::info!(
++                "memlog: swf {} bytes uncompressed ({} compressed) {url}",
++                swf_buf.data.len(),
++                swf_data.len()
++            );
++        }
+         let encoding = swf::SwfStr::encoding_for_version(swf_buf.header.version());
+ 
+         // The loader SWF has full control over the tags of a SWF loaded using
+diff --git a/core/src/backend/audio/mixer.rs b/core/src/backend/audio/mixer.rs
+index 67eac572..2387f5fa 100644
+--- a/core/src/backend/audio/mixer.rs
++++ b/core/src/backend/audio/mixer.rs
+@@ -522,6 +522,18 @@ impl AudioMixer {
+             (0, swf_sound.data)
+         };
+ 
++        ruffle_render::memlog::add_static(
++            ruffle_render::memlog::Cat::Sound,
++            data.len() as u64,
++            || {
++                format!(
++                    "sound {:?} {} Hz, {} frames",
++                    swf_sound.format.compression,
++                    swf_sound.format.sample_rate,
++                    swf_sound.num_samples
++                )
++            },
++        );
+         let sound = Sound {
+             format: swf_sound.format.clone(),
+             data: Arc::from(data),
+diff --git a/core/src/bitmap/bitmap_data.rs b/core/src/bitmap/bitmap_data.rs
+index 8cf0d48f..e5a74e26 100644
+--- a/core/src/bitmap/bitmap_data.rs
++++ b/core/src/bitmap/bitmap_data.rs
+@@ -403,6 +403,10 @@ pub struct BitmapRawData<'gc> {
+     #[collect(require_static)]
+     dirty_state: DirtyState,
+ 
++    /// PortMaster port: memory accounting of `pixels` (`RUFFLE_MEMLOG`).
++    #[collect(require_static)]
++    mem: ruffle_render::memlog::Tag,
++
+     /// Holds an egui texture handle, used for rendering this Bitmap in the debug ui.
+     /// This is automatically set to `None` when the texture is updated (either from
+     /// marking the CPU side dirty, or from performing a GPU -> CPU sync).
+@@ -441,6 +445,29 @@ fn zeroed_color_vec(len: usize) -> Vec<Color> {
+     }
+ }
+ 
++/// PortMaster port: the memory accounting tag of a BitmapData's CPU pixels (`RUFFLE_MEMLOG`).
++fn pixels_tag(
++    width: u32,
++    height: u32,
++    transparency: bool,
++    how: &str,
++) -> ruffle_render::memlog::Tag {
++    ruffle_render::memlog::Tag::new(
++        ruffle_render::memlog::Cat::CpuPixels,
++        u64::from(width) * u64::from(height) * 4,
++        || {
++            format!(
++                "BitmapData {width}x{height} {} ({how})",
++                if transparency {
++                    "transparent"
++                } else {
++                    "opaque"
++                }
++            )
++        },
++    )
++}
++
+ #[derive(Clone, Debug)]
+ pub enum DirtyState {
+     // Both the CPU and GPU pixels are up to date. We do not need to wait for any syncs to complete
+@@ -465,7 +492,7 @@ mod wrapper {
+     use ruffle_render::commands::CommandHandler;
+     use std::cell::Ref;
+ 
+-    use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
++    use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata, pixels_tag};
+ 
+     /// A wrapper type that ensures that we always wait for a pending
+     /// GPU -> CPU sync to complete (using `sync_handle`) before accessing
+@@ -521,6 +548,7 @@ mod wrapper {
+                     avm2_object: None,
+                     display_objects: vec![],
+                     dirty_state: DirtyState::Clean,
++                    mem: ruffle_render::memlog::Tag::NONE,
+                     #[cfg(feature = "egui")]
+                     egui_texture: Default::default(),
+                 }
+@@ -545,6 +573,7 @@ mod wrapper {
+                 display_objects: vec![],
+                 // We have no GPU texture, so there's no need to mark as dirty
+                 dirty_state: DirtyState::Clean,
++                mem: pixels_tag(data.width, data.height, data.transparency, "clone"),
+                 #[cfg(feature = "egui")]
+                 egui_texture: Default::default(),
+             }
+@@ -562,6 +591,9 @@ mod wrapper {
+                 .borrow_mut();
+             match std::mem::replace(&mut write.dirty_state, DirtyState::Clean) {
+                 DirtyState::GpuModified(sync_handle, bounds) => {
++                    ruffle_render::memlog::readback(
++                        u64::from(bounds.width()) * u64::from(bounds.height()) * 4,
++                    );
+                     renderer
+                         .resolve_sync_handle(
+                             sync_handle,
+@@ -792,6 +824,7 @@ impl<'gc> BitmapRawData<'gc> {
+             avm2_object: None,
+             display_objects: vec![],
+             dirty_state: DirtyState::Clean,
++            mem: pixels_tag(width, height, transparency, "new"),
+             #[cfg(feature = "egui")]
+             egui_texture: Default::default(),
+         }
+@@ -812,6 +845,7 @@ impl<'gc> BitmapRawData<'gc> {
+             avm2_object: None,
+             disposed: false,
+             dirty_state: DirtyState::Clean,
++            mem: pixels_tag(width, height, transparency, "with pixels"),
+             display_objects: vec![],
+             #[cfg(feature = "egui")]
+             egui_texture: Default::default(),
+@@ -826,6 +860,7 @@ impl<'gc> BitmapRawData<'gc> {
+         self.width = 0;
+         self.height = 0;
+         self.pixels = Vec::new(); // free the CPU pixel buffer
++        self.mem.set_bytes(0);
+         self.bitmap_handle = None;
+         // There's no longer a handle to update
+         self.dirty_state = DirtyState::Clean;
+@@ -840,6 +875,9 @@ impl<'gc> BitmapRawData<'gc> {
+             return Ok(handle.clone());
+         }
+ 
++        // Textures made here are BitmapData textures in the memory accounting (`RUFFLE_MEMLOG`)
++        let _ctx = ruffle_render::memlog::ctx("bitmapdata");
++
+         // PortMaster port (`RUFFLE_EMPTY_TEXTURES`, default on, "0" turns it off): a bitmap
+         // that is still all zero (a fresh cache canvas) gets an empty texture, which wgpu
+         // zero-initialises on the GPU. Uploading the zeros cost an RGBA copy of the pixels and
+diff --git a/core/src/bitmap/operations.rs b/core/src/bitmap/operations.rs
+index 4db9211a..9742d5f6 100644
+--- a/core/src/bitmap/operations.rs
++++ b/core/src/bitmap/operations.rs
+@@ -1465,6 +1465,7 @@ pub fn draw<'gc>(
+         }
+     }
+ 
++    let _memlog_ctx = ruffle_render::memlog::ctx("bitmapdata.draw");
+     let mut transform_stack = ruffle_render::transform::TransformStack::new();
+     transform_stack.push(&transform);
+ 
+diff --git a/core/src/character.rs b/core/src/character.rs
+index f1843308..9901c15b 100644
+--- a/core/src/character.rs
++++ b/core/src/character.rs
+@@ -46,6 +46,19 @@ pub struct BitmapCharacter<'gc> {
+ 
+ impl<'gc> BitmapCharacter<'gc> {
+     pub fn new(compressed: CompressedBitmap) -> Self {
++        ruffle_render::memlog::add_static(
++            ruffle_render::memlog::Cat::Library,
++            match &compressed {
++                CompressedBitmap::Jpeg { data, alpha, .. } => {
++                    (data.len() + alpha.as_ref().map_or(0, |a| a.len())) as u64
++                }
++                CompressedBitmap::Lossless(l) => l.data.len() as u64,
++            },
++            || {
++                let size = compressed.size();
++                format!("compressed bitmap {}x{}", size.width, size.height)
++            },
++        );
+         Self {
+             compressed,
+             handle: OnceCell::default(),
+diff --git a/core/src/display_object/graphic.rs b/core/src/display_object/graphic.rs
+index bc30f92e..3157cbd7 100644
+--- a/core/src/display_object/graphic.rs
++++ b/core/src/display_object/graphic.rs
+@@ -64,6 +64,9 @@ impl<'gc> Graphic<'gc> {
+         // bytes when the shape is first rendered or hit-tested. They held about 95 MB for World 2
+         // of Fancy Pants Adventures, most of it shapes of levels that are not being played.
+         let lazy_records = lazy_shapes() && lazy_shape_records() && tag.is_some();
++        if !lazy_records {
++            account_records(&swf_shape, "preload");
++        }
+         let render_handle = if lazy_shapes() {
+             None
+         } else {
+@@ -424,7 +427,10 @@ impl GraphicShared {
+             let tag = self.tag.as_ref().expect("a lazy shape keeps its tag");
+             let mut reader = swf::read::Reader::new(tag.slice.data(), tag.swf_version);
+             match reader.read_define_shape(tag.version) {
+-                Ok(shape) => shape,
++                Ok(shape) => {
++                    account_records(&shape, "parsed on demand");
++                    shape
++                }
+                 Err(e) => {
+                     tracing::error!("Failed to parse shape {} again: {e}", self.id);
+                     swf::Shape {
+@@ -445,6 +451,21 @@ impl GraphicShared {
+     }
+ }
+ 
++/// PortMaster port: approximate size of parsed shape records (`RUFFLE_MEMLOG`).
++fn account_records(shape: &swf::Shape, how: &'static str) {
++    ruffle_render::memlog::add_static(
++        ruffle_render::memlog::Cat::Library,
++        (shape.shape.capacity() * std::mem::size_of::<swf::ShapeRecord>()
++            + shape
++                .shape
++                .iter()
++                .filter(|r| matches!(r, swf::ShapeRecord::StyleChange(_)))
++                .count()
++                * std::mem::size_of::<swf::StyleChangeData>()) as u64,
++        || format!("shape {} records ({}, {how})", shape.id, shape.shape.len()),
++    );
++}
++
+ /// PortMaster port: `RUFFLE_LAZY_SHAPE_RECORDS` (default on; "0" turns it off), see
+ /// `Graphic::from_swf_tag`.
+ fn lazy_shape_records() -> bool {
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 76ddac6b..4d10ce30 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2468,6 +2468,11 @@ impl Player {
+         self.gc_arena.borrow_mut().finish_cycle();
+     }
+ 
++    /// The number of live gc objects (for memory accounting in front ends).
++    pub fn gc_count(&self) -> usize {
++        self.gc_arena.borrow().metrics().total_gc_count()
++    }
++
+     /// Makes the incremental collector do extra work: `fraction` of a full cycle (of the live
+     /// heap) on top of what allocations pay for. gc-arena only counts the size of the objects
+     /// themselves, not the buffers they own (strings, XML, arrays), so a game that churns those
+diff --git a/render/src/lib.rs b/render/src/lib.rs
+index c3d53d2d..9f9bd4f2 100644
+--- a/render/src/lib.rs
++++ b/render/src/lib.rs
+@@ -9,6 +9,7 @@ pub mod filters;
+ pub mod lines;
+ pub mod matrix;
+ pub mod matrix3d;
++pub mod memlog;
+ pub mod perspective_projection;
+ pub mod pixel_bender_support;
+ // The `renderdoc` crate doesn't compile on apple platforms
+diff --git a/render/src/memlog.rs b/render/src/memlog.rs
+new file mode 100644
+index 00000000..8c419ca9
+--- /dev/null
++++ b/render/src/memlog.rs
+@@ -0,0 +1,323 @@
++//! PortMaster port: memory accounting by category (`RUFFLE_MEMLOG=1`).
++//!
++//! Large allocations (BitmapData CPU pixels, textures, pooled render targets, shape meshes,
++//! sounds) carry a [`Tag`] that adds its size to a category while it lives. The front end samples
++//! the totals together with the process RSS (`ruffle_sdl`: a line per second, the biggest items at
++//! the RSS peak). Off by default: a disabled `Tag` is inert and costs one branch.
++
++use std::cell::Cell;
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++use std::time::Instant;
++
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++pub enum Cat {
++    /// CPU pixel buffers of BitmapData objects (`BitmapRawData::pixels`).
++    CpuPixels,
++    /// Textures of BitmapData objects (`register_bitmap` from a BitmapData).
++    BitmapTex,
++    /// Textures of SWF-embedded bitmaps and other `register_bitmap` callers.
++    SwfBitmapTex,
++    /// cacheAsBitmap textures (`create_empty_texture`).
++    CabTex,
++    /// Pooled render targets (frame, resolve, blend and stencil buffers).
++    PoolTex,
++    /// Shape meshes (vertex, index, uniform buffers and gradient textures) tessellated while
++    /// rendering the stage.
++    Mesh,
++    /// Shape meshes first tessellated inside a `BitmapData.draw`.
++    MeshDraw,
++    /// Registered sounds (compressed data copied into the mixer).
++    Sound,
++    /// Uncompressed SWF data.
++    Swf,
++    /// Parsed library characters kept for the life of the movie (approximate): shape records of
++    /// DefineShape characters, compressed bitmap data.
++    Library,
++}
++
++pub const CATS: [Cat; 10] = [
++    Cat::CpuPixels,
++    Cat::BitmapTex,
++    Cat::SwfBitmapTex,
++    Cat::CabTex,
++    Cat::PoolTex,
++    Cat::Mesh,
++    Cat::MeshDraw,
++    Cat::Sound,
++    Cat::Swf,
++    Cat::Library,
++];
++
++impl Cat {
++    pub fn name(self) -> &'static str {
++        match self {
++            Cat::CpuPixels => "cpu_px",
++            Cat::BitmapTex => "bmd_tex",
++            Cat::SwfBitmapTex => "swf_tex",
++            Cat::CabTex => "cab_tex",
++            Cat::PoolTex => "pool_tex",
++            Cat::Mesh => "mesh",
++            Cat::MeshDraw => "mesh_draw",
++            Cat::Sound => "sound",
++            Cat::Swf => "swf",
++            Cat::Library => "library",
++        }
++    }
++
++    fn index(self) -> usize {
++        self as usize
++    }
++}
++
++const N: usize = CATS.len();
++
++#[expect(clippy::declare_interior_mutable_const)]
++const ZERO: AtomicI64 = AtomicI64::new(0);
++static BYTES: [AtomicI64; N] = [ZERO; N];
++static COUNT: [AtomicI64; N] = [ZERO; N];
++static PEAK: [AtomicI64; N] = [ZERO; N];
++static NEXT_ID: AtomicU64 = AtomicU64::new(1);
++/// Readbacks of GPU results into CPU pixels: count and bytes.
++static READBACKS: AtomicI64 = AtomicI64::new(0);
++static READBACK_BYTES: AtomicI64 = AtomicI64::new(0);
++/// Gauges set by the front end (gc object count).
++static GC_COUNT: AtomicI64 = AtomicI64::new(0);
++
++struct Item {
++    cat: Cat,
++    bytes: u64,
++    desc: String,
++    born: f32,
++}
++
++fn items() -> &'static Mutex<HashMap<u64, Item>> {
++    static ITEMS: OnceLock<Mutex<HashMap<u64, Item>>> = OnceLock::new();
++    ITEMS.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++fn start() -> Instant {
++    static START: OnceLock<Instant> = OnceLock::new();
++    *START.get_or_init(Instant::now)
++}
++
++/// `RUFFLE_MEMLOG` is set (and not "0").
++pub fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var("RUFFLE_MEMLOG").is_ok_and(|v| !v.is_empty() && v != "0");
++        if on {
++            start();
++        }
++        on
++    })
++}
++
++thread_local! {
++    static CTX: Cell<&'static str> = const { Cell::new("") };
++}
++
++/// What the current thread is doing ("bitmapdata", "bitmapdata.draw"); allocations made
++/// meanwhile are attributed to it. Restored when the guard drops.
++pub struct CtxGuard(&'static str);
++
++pub fn ctx(name: &'static str) -> CtxGuard {
++    CtxGuard(CTX.with(|c| c.replace(name)))
++}
++
++impl Drop for CtxGuard {
++    fn drop(&mut self) {
++        CTX.with(|c| c.set(self.0));
++    }
++}
++
++pub fn current_ctx() -> &'static str {
++    CTX.with(|c| c.get())
++}
++
++/// Adds `bytes` to `cat` while it lives.
++#[derive(Debug, Default)]
++pub struct Tag {
++    id: u64,
++    cat: Option<Cat>,
++    bytes: u64,
++}
++
++impl Tag {
++    pub const NONE: Tag = Tag {
++        id: 0,
++        cat: None,
++        bytes: 0,
++    };
++
++    pub fn new(cat: Cat, bytes: u64, desc: impl FnOnce() -> String) -> Tag {
++        if !enabled() {
++            return Tag::NONE;
++        }
++        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++        add(cat, bytes as i64, 1);
++        let born = start().elapsed().as_secs_f32();
++        if let Ok(mut items) = items().lock() {
++            items.insert(
++                id,
++                Item {
++                    cat,
++                    bytes,
++                    desc: desc(),
++                    born,
++                },
++            );
++        }
++        Tag {
++            id,
++            cat: Some(cat),
++            bytes,
++        }
++    }
++
++    pub fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    /// The tagged allocation changed size (0: freed, the item stays listed until the tag drops).
++    pub fn set_bytes(&mut self, bytes: u64) {
++        let Some(cat) = self.cat else { return };
++        add(cat, bytes as i64 - self.bytes as i64, 0);
++        self.bytes = bytes;
++        if let Ok(mut items) = items().lock()
++            && let Some(item) = items.get_mut(&self.id)
++        {
++            item.bytes = bytes;
++        }
++    }
++}
++
++impl Drop for Tag {
++    fn drop(&mut self) {
++        let Some(cat) = self.cat else { return };
++        add(cat, -(self.bytes as i64), -1);
++        if let Ok(mut items) = items().lock() {
++            items.remove(&self.id);
++        }
++    }
++}
++
++fn add(cat: Cat, bytes: i64, count: i64) {
++    let i = cat.index();
++    let now = BYTES[i].fetch_add(bytes, Ordering::Relaxed) + bytes;
++    COUNT[i].fetch_add(count, Ordering::Relaxed);
++    PEAK[i].fetch_max(now, Ordering::Relaxed);
++}
++
++/// Adds bytes that are never freed (sounds, SWF data) to `cat`.
++pub fn add_static(cat: Cat, bytes: u64, desc: impl FnOnce() -> String) {
++    if enabled() {
++        std::mem::forget(Tag::new(cat, bytes, desc));
++    }
++}
++
++/// A GPU result was read back into CPU pixels.
++pub fn readback(bytes: u64) {
++    if enabled() {
++        READBACKS.fetch_add(1, Ordering::Relaxed);
++        READBACK_BYTES.fetch_add(bytes as i64, Ordering::Relaxed);
++    }
++}
++
++pub fn set_gc_count(count: usize) {
++    GC_COUNT.store(count as i64, Ordering::Relaxed);
++}
++
++const MB: f64 = 1024.0 * 1024.0;
++
++/// Category totals in MB with counts: "cpu_px 123.4/56 bmd_tex ...".
++pub fn totals_line() -> String {
++    let mut s = String::new();
++    let mut sum = 0;
++    for cat in CATS {
++        let b = BYTES[cat.index()].load(Ordering::Relaxed);
++        sum += b;
++        s += &format!(
++            "{} {:.1}/{} ",
++            cat.name(),
++            b as f64 / MB,
++            COUNT[cat.index()].load(Ordering::Relaxed)
++        );
++    }
++    s += &format!(
++        "| sum {:.1} | readbacks {} ({:.1} MB) gc_objs {}",
++        sum as f64 / MB,
++        READBACKS.load(Ordering::Relaxed),
++        READBACK_BYTES.load(Ordering::Relaxed) as f64 / MB,
++        GC_COUNT.load(Ordering::Relaxed)
++    );
++    s
++}
++
++pub fn total_bytes() -> i64 {
++    CATS.iter()
++        .map(|c| BYTES[c.index()].load(Ordering::Relaxed))
++        .sum()
++}
++
++/// Per-category peaks.
++pub fn peaks_line() -> String {
++    CATS.iter()
++        .map(|c| {
++            format!(
++                "{} {:.1}",
++                c.name(),
++                PEAK[c.index()].load(Ordering::Relaxed) as f64 / MB
++            )
++        })
++        .collect::<Vec<_>>()
++        .join(" ")
++}
++
++/// The `n` biggest live items of each category, plus counts by description for the rest.
++pub fn top_items(n: usize) -> String {
++    let Ok(items) = items().lock() else {
++        return String::new();
++    };
++    let mut out = String::new();
++    for cat in CATS {
++        let mut list: Vec<&Item> = items
++            .values()
++            .filter(|i| i.cat == cat && i.bytes > 0)
++            .collect();
++        if list.is_empty() {
++            continue;
++        }
++        list.sort_by_key(|i| std::cmp::Reverse(i.bytes));
++        let total: u64 = list.iter().map(|i| i.bytes).sum();
++        out += &format!(
++            "  [{}] {} items, {:.1} MB\n",
++            cat.name(),
++            list.len(),
++            total as f64 / MB
++        );
++        for item in list.iter().take(n) {
++            out += &format!(
++                "    {:8.2} MB  t={:6.1}s  {}\n",
++                item.bytes as f64 / MB,
++                item.born,
++                item.desc
++            );
++        }
++        if list.len() > n {
++            let rest: u64 = list.iter().skip(n).map(|i| i.bytes).sum();
++            out += &format!(
++                "    {:8.2} MB  in {} more\n",
++                rest as f64 / MB,
++                list.len() - n
++            );
++        }
++    }
++    out
++}
++
++/// Seconds since the first tagged allocation.
++pub fn elapsed() -> f32 {
++    start().elapsed().as_secs_f32()
++}
+diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
+index 147f70e4..5bfd6c39 100644
+--- a/render/wgpu/src/backend.rs
++++ b/render/wgpu/src/backend.rs
+@@ -353,16 +353,46 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
+                 _ => None,
+             })
+             .collect();
+-        let draws = draws
++        let draws: Vec<_> = draws
+             .into_iter()
+             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
+             .collect();
+ 
++        let mem = if ruffle_render::memlog::enabled() {
++            let ctx = ruffle_render::memlog::current_ctx();
++            let bytes = vertex_buffer.size()
++                + index_buffer.size()
++                + uniform_buffer.size()
++                + gradients.len() as u64 * crate::mesh::GRADIENT_TEXTURE_BYTES;
++            ruffle_render::memlog::Tag::new(
++                if ctx == "bitmapdata.draw" {
++                    ruffle_render::memlog::Cat::MeshDraw
++                } else {
++                    ruffle_render::memlog::Cat::Mesh
++                },
++                bytes,
++                || {
++                    format!(
++                        "shape {} x{scale}: vtx {} B idx {} B unif {} B, {} draws, {} gradients",
++                        shape_id,
++                        vertex_buffer.size(),
++                        index_buffer.size(),
++                        uniform_buffer.size(),
++                        draws.len(),
++                        gradients.len()
++                    )
++                },
++            )
++        } else {
++            ruffle_render::memlog::Tag::NONE
++        };
++
+         Mesh {
+             draws,
+             vertex_buffer,
+             index_buffer,
+             bitmaps,
++            mem,
+         }
+     }
+ 
+@@ -791,6 +821,25 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+             clamped_linear: Default::default(),
+             clamped_nearest: Default::default(),
+             copy_count: Cell::new(0),
++            mem: {
++                let ctx = ruffle_render::memlog::current_ctx();
++                ruffle_render::memlog::Tag::new(
++                    if ctx.starts_with("bitmapdata") {
++                        ruffle_render::memlog::Cat::BitmapTex
++                    } else {
++                        ruffle_render::memlog::Cat::SwfBitmapTex
++                    },
++                    u64::from(extent.width) * u64::from(extent.height) * 4,
++                    || {
++                        format!(
++                            "texture {}x{} ({})",
++                            extent.width,
++                            extent.height,
++                            if ctx.is_empty() { "swf" } else { ctx }
++                        )
++                    },
++                )
++            },
+         }));
+ 
+         Ok(handle)
+@@ -1102,6 +1151,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+                     clamped_linear: Default::default(),
+                     clamped_nearest: Default::default(),
+                     copy_count: Cell::new(0),
++                    mem: Default::default(),
+                 }))
+             }
+         };
+@@ -1262,6 +1312,24 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+             clamped_linear: Default::default(),
+             clamped_nearest: Default::default(),
+             copy_count: Cell::new(0),
++            mem: {
++                let ctx = ruffle_render::memlog::current_ctx();
++                ruffle_render::memlog::Tag::new(
++                    if ctx.starts_with("bitmapdata") {
++                        ruffle_render::memlog::Cat::BitmapTex
++                    } else {
++                        ruffle_render::memlog::Cat::CabTex
++                    },
++                    u64::from(width) * u64::from(height) * 4,
++                    || {
++                        if ctx.is_empty() {
++                            format!("cacheAsBitmap texture {width}x{height}")
++                        } else {
++                            format!("empty texture {width}x{height} ({ctx})")
++                        }
++                    },
++                )
++            },
+         })))
+     }
+ 
+diff --git a/render/wgpu/src/buffer_pool.rs b/render/wgpu/src/buffer_pool.rs
+index 7d36ac70..140c8f8d 100644
+--- a/render/wgpu/src/buffer_pool.rs
++++ b/render/wgpu/src/buffer_pool.rs
+@@ -8,9 +8,17 @@ use std::sync::{Arc, Mutex, Weak};
+ type PoolInner<T> = Mutex<Vec<T>>;
+ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
+ 
++/// A pooled texture with its view; the tag accounts for it (`RUFFLE_MEMLOG`). Boxed, so the frame
++/// buffer variants that hold a pool entry do not grow.
++pub type PooledTexture = (
++    wgpu::Texture,
++    wgpu::TextureView,
++    Box<ruffle_render::memlog::Tag>,
++);
++
+ #[derive(Debug, Default)]
+ pub struct TexturePool {
+-    pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
++    pools: FnvHashMap<TextureKey, BufferPool<PooledTexture, AlwaysCompatible>>,
+     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+ }
+ 
+@@ -26,7 +34,7 @@ impl TexturePool {
+         usage: wgpu::TextureUsages,
+         format: wgpu::TextureFormat,
+         sample_count: u32,
+-    ) -> PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible> {
++    ) -> PoolEntry<PooledTexture, AlwaysCompatible> {
+         let key = TextureKey {
+             size,
+             usage,
+@@ -54,7 +62,29 @@ impl TexturePool {
+                     usage,
+                 });
+                 let view = texture.create_view(&Default::default());
+-                (texture, view)
++                let mem = ruffle_render::memlog::Tag::new(
++                    ruffle_render::memlog::Cat::PoolTex,
++                    u64::from(size.width)
++                        * u64::from(size.height)
++                        * u64::from(sample_count)
++                        * u64::from(
++                            format
++                                .block_copy_size(None)
++                                .or(format.block_copy_size(Some(wgpu::TextureAspect::StencilOnly)))
++                                .unwrap_or(4),
++                        ),
++                    || {
++                        format!(
++                            "pooled {}x{} {:?} x{} samples ({})",
++                            size.width,
++                            size.height,
++                            format,
++                            sample_count,
++                            ruffle_render::memlog::current_ctx()
++                        )
++                    },
++                );
++                (texture, view, Box::new(mem))
+             }))
+         });
+         pool.take(descriptors, AlwaysCompatible)
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index 60fff3c8..ccec04d3 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -120,6 +120,7 @@ impl WgpuContext3D {
+                 clamped_nearest: Default::default(),
+                 texture: dummy_texture,
+                 copy_count: Cell::new(0),
++                mem: Default::default(),
+             }))
+         };
+ 
+@@ -665,6 +666,7 @@ impl Context3D for WgpuContext3D {
+                         clamped_linear: Default::default(),
+                         clamped_nearest: Default::default(),
+                         copy_count: Cell::new(0),
++                        mem: Default::default(),
+                     }));
+                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
+                         texture: front_buffer_resolve_texture.unwrap(),
+@@ -673,6 +675,7 @@ impl Context3D for WgpuContext3D {
+                         clamped_linear: Default::default(),
+                         clamped_nearest: Default::default(),
+                         copy_count: Cell::new(0),
++                        mem: Default::default(),
+                     }));
+                 } else {
+                     // In non-multisample mode, we don't have a separate resolve buffer,
+@@ -685,6 +688,7 @@ impl Context3D for WgpuContext3D {
+                         clamped_linear: Default::default(),
+                         clamped_nearest: Default::default(),
+                         copy_count: Cell::new(0),
++                        mem: Default::default(),
+                     }));
+                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
+                         texture: front_buffer_texture,
+@@ -693,6 +697,7 @@ impl Context3D for WgpuContext3D {
+                         clamped_linear: Default::default(),
+                         clamped_nearest: Default::default(),
+                         copy_count: Cell::new(0),
++                        mem: Default::default(),
+                     }));
+                     self.current_texture_resolve_view = None;
+                 }
+diff --git a/render/wgpu/src/lib.rs b/render/wgpu/src/lib.rs
+index 1787a84b..3dca74e9 100644
+--- a/render/wgpu/src/lib.rs
++++ b/render/wgpu/src/lib.rs
+@@ -275,6 +275,9 @@ pub struct Texture {
+     clamped_linear: OnceCell<BitmapBinds>,
+     clamped_nearest: OnceCell<BitmapBinds>,
+     copy_count: Cell<u8>,
++    /// PortMaster port: memory accounting (`RUFFLE_MEMLOG`); only its drop matters.
++    #[expect(dead_code)]
++    pub(crate) mem: ruffle_render::memlog::Tag,
+ }
+ 
+ impl Texture {
+diff --git a/render/wgpu/src/mesh.rs b/render/wgpu/src/mesh.rs
+index 8bfa4d50..bd4a08cc 100644
+--- a/render/wgpu/src/mesh.rs
++++ b/render/wgpu/src/mesh.rs
+@@ -22,8 +22,14 @@ pub struct Mesh {
+     /// PortMaster port: the bitmaps the mesh's fills sample (so an offscreen draw can tell
+     /// whether it samples its own target).
+     pub bitmaps: Vec<BitmapHandle>,
++    /// PortMaster port: memory accounting (`RUFFLE_MEMLOG`); only its drop matters.
++    #[expect(dead_code)]
++    pub mem: ruffle_render::memlog::Tag,
+ }
+ 
++/// PortMaster port: size of one gradient texture (memory accounting).
++pub const GRADIENT_TEXTURE_BYTES: u64 = GRADIENT_SIZE as u64 * 4;
++
+ impl ShapeHandleImpl for Mesh {}
+ 
+ pub fn as_mesh(handle: &ShapeHandle) -> &Mesh {
+diff --git a/render/wgpu/src/pixel_bender.rs b/render/wgpu/src/pixel_bender.rs
+index ea1e1e38..0886dd2c 100644
+--- a/render/wgpu/src/pixel_bender.rs
++++ b/render/wgpu/src/pixel_bender.rs
+@@ -488,6 +488,7 @@ pub(super) fn run_pixelbender_shader_impl(
+                             clamped_linear: Default::default(),
+                             clamped_nearest: Default::default(),
+                             copy_count: Cell::new(0),
++                            mem: Default::default(),
+                         }))
+                     });
+                     *texture = Some(cached_fresh_handle.clone().into());
+diff --git a/render/wgpu/src/surface/target.rs b/render/wgpu/src/surface/target.rs
+index b72dcc71..4e976e3d 100644
+--- a/render/wgpu/src/surface/target.rs
++++ b/render/wgpu/src/surface/target.rs
+@@ -1,5 +1,5 @@
+ use crate::backend::RenderTargetMode;
+-use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool};
++use crate::buffer_pool::{AlwaysCompatible, PoolEntry, PooledTexture, TexturePool};
+ use crate::descriptors::Descriptors;
+ use crate::globals::Globals;
+ use crate::utils::run_copy_pipeline;
+@@ -65,7 +65,7 @@ pub struct FrameBuffer {
+ /// (when rendering to the main screen), or rendering to a non-pooled `Texture`
+ /// (when doing an offscreen render to a BitmapData texture)
+ pub enum PoolOrArcTexture {
+-    Pool(PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>),
++    Pool(PoolEntry<PooledTexture, AlwaysCompatible>),
+     Manual((wgpu::Texture, wgpu::TextureView)),
+ }
+ 
+@@ -136,7 +136,7 @@ impl FrameBuffer {
+ 
+ #[derive(Debug)]
+ pub struct BlendBuffer {
+-    texture: PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>,
++    texture: PoolEntry<PooledTexture, AlwaysCompatible>,
+ }
+ 
+ impl BlendBuffer {
+@@ -163,7 +163,7 @@ impl BlendBuffer {
+ 
+ #[derive(Debug)]
+ pub struct StencilBuffer {
+-    texture: PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>,
++    texture: PoolEntry<PooledTexture, AlwaysCompatible>,
+ }
+ 
+ impl StencilBuffer {
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index 5ac9cc38..60b52912 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -459,6 +459,7 @@ fn main() -> anyhow::Result<()> {
+             .unwrap_or(1.0),
+     );
+     let mut collect_now = false;
++    spawn_memlog();
+     // RUFFLE_SDL_TIMING=1: share of wall time in tick / render / swap, every 2 s
+     let timing_log = std::env::var_os("RUFFLE_SDL_TIMING").is_some();
+     let mut timing = (
+@@ -573,6 +574,9 @@ fn main() -> anyhow::Result<()> {
+             let t0 = Instant::now();
+             player.tick(dt);
+             let t1 = Instant::now();
++            if ruffle_render::memlog::enabled() {
++                ruffle_render::memlog::set_gc_count(player.gc_count());
++            }
+             if !long_tick.is_zero() && t1 - t0 >= long_tick {
+                 tracing::info!(
+                     "long tick: {:.2} s (a load; collecting after it)",
+@@ -649,6 +653,161 @@ fn mouse_button(button: SdlMouseButton) -> MouseButton {
+ 
+ unsafe extern "C" {
+     fn malloc_trim(pad: usize) -> i32;
++    fn mallinfo() -> MallInfo;
++    fn dlsym(
++        handle: *mut std::ffi::c_void,
++        symbol: *const std::ffi::c_char,
++    ) -> *mut std::ffi::c_void;
++}
++
++/// glibc `struct mallinfo` (int fields; the only one before glibc 2.33).
++#[repr(C)]
++struct MallInfo {
++    arena: i32,
++    ordblks: i32,
++    smblks: i32,
++    hblks: i32,
++    hblkhd: i32,
++    usmblks: i32,
++    fsmblks: i32,
++    uordblks: i32,
++    fordblks: i32,
++    keepcost: i32,
++}
++
++/// (in use, free in heap) bytes of the C heap: `mallinfo2` when glibc has it (2.33+), else `mallinfo`
++/// (wraps above 2 GB, fine for 1 GB handhelds). Looked up at run time so the binary still runs on 2.30.
++fn heap_usage() -> (usize, usize) {
++    // RTLD_DEFAULT is a null handle on glibc
++    let f = unsafe { dlsym(std::ptr::null_mut(), c"mallinfo2".as_ptr()) };
++    if !f.is_null() {
++        // SAFETY: the symbol is glibc's mallinfo2, which only reads allocator statistics.
++        let f: extern "C" fn() -> MallInfo2 = unsafe { std::mem::transmute(f) };
++        let info = f();
++        (info.uordblks + info.hblkhd, info.fordblks)
++    } else {
++        // SAFETY: mallinfo only reads allocator statistics.
++        let info = unsafe { mallinfo() };
++        (
++            info.uordblks as u32 as usize + info.hblkhd as u32 as usize,
++            info.fordblks as u32 as usize,
++        )
++    }
++}
++
++/// glibc `struct mallinfo2` (memory accounting, `RUFFLE_MEMLOG`).
++#[repr(C)]
++struct MallInfo2 {
++    arena: usize,
++    ordblks: usize,
++    smblks: usize,
++    hblks: usize,
++    hblkhd: usize,
++    usmblks: usize,
++    fsmblks: usize,
++    uordblks: usize,
++    fordblks: usize,
++    keepcost: usize,
++}
++
++/// PortMaster port (`RUFFLE_MEMLOG=1`): a thread samples the process RSS (VmRSS, RssAnon,
++/// RssFile) every `RUFFLE_MEMLOG_MS` (100) ms and logs, once a second, the highest sample of that
++/// second with the memory categories of `ruffle_render::memlog` at that moment. At every new RSS
++/// peak the biggest items of each category are written to `RUFFLE_MEMLOG_PEAK` (a file; logged
++/// once at the end of a 1 s window when unset).
++fn spawn_memlog() {
++    use ruffle_render::memlog;
++    if !memlog::enabled() {
++        return;
++    }
++    let peak_file = std::env::var("RUFFLE_MEMLOG_PEAK").ok();
++    let every = Duration::from_millis(
++        std::env::var("RUFFLE_MEMLOG_MS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(100),
++    );
++    let top: usize = std::env::var("RUFFLE_MEMLOG_TOP")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(8);
++    std::thread::spawn(move || {
++        let status = || -> (u64, u64, u64) {
++            let mut v = (0, 0, 0);
++            if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
++                for line in text.lines() {
++                    let kb = |l: &str| {
++                        l.split_whitespace()
++                            .nth(1)
++                            .and_then(|n| n.parse::<u64>().ok())
++                            .unwrap_or(0)
++                    };
++                    if line.starts_with("VmRSS:") {
++                        v.0 = kb(line);
++                    } else if line.starts_with("RssAnon:") {
++                        v.1 = kb(line);
++                    } else if line.starts_with("RssFile:") {
++                        v.2 = kb(line);
++                    }
++                }
++            }
++            v
++        };
++        let mut peak_rss = 0;
++        let mut pending_peak: Option<String> = None;
++        let mut window: Option<((u64, u64, u64), String)> = None;
++        let mut window_start = Instant::now();
++        loop {
++            std::thread::sleep(every);
++            let rss = status();
++            let totals = memlog::totals_line();
++            if window.as_ref().is_none_or(|w| rss.0 > w.0.0) {
++                window = Some((rss, totals.clone()));
++            }
++            if rss.0 > peak_rss + 1024 {
++                peak_rss = rss.0;
++                let report = format!(
++                    "RSS peak at t={:.1}s: rss {} MB (anon {} MB, file {} MB)\n\
++                     categories (MB/count): {}\n\
++                     category peaks so far (MB): {}\n\
++                     biggest items:\n{}",
++                    memlog::elapsed(),
++                    rss.0 / 1024,
++                    rss.1 / 1024,
++                    rss.2 / 1024,
++                    totals,
++                    memlog::peaks_line(),
++                    memlog::top_items(top)
++                );
++                match &peak_file {
++                    Some(path) => {
++                        let _ = std::fs::write(path, &report);
++                    }
++                    None => pending_peak = Some(report),
++                }
++            }
++            if window_start.elapsed() >= Duration::from_secs(1) {
++                if let Some(((rss, anon, file), totals)) = window.take() {
++                    let (heap_used, heap_free) = heap_usage();
++                    tracing::info!(
++                        target: "memlog",
++                        "t={:.1} rss {} anon {} file {} MB malloc {} MB (+{} MB free in heap) | {}",
++                        memlog::elapsed(),
++                        rss / 1024,
++                        anon / 1024,
++                        file / 1024,
++                        heap_used / (1024 * 1024),
++                        heap_free / (1024 * 1024),
++                        totals
++                    );
++                }
++                if let Some(report) = pending_peak.take() {
++                    tracing::info!(target: "memlog", "{report}");
++                }
++                window_start = Instant::now();
++            }
++        }
++    });
+ }
+ 
+ fn rss_mb() -> u64 {

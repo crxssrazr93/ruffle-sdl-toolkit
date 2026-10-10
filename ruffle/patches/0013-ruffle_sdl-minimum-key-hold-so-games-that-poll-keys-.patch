@@ -1,0 +1,113 @@
+From fe5a0059990d9fe51345c90337e3bf0ed19aa4a8 Mon Sep 17 00:00:00 2001
+From: crxssrazr93 <crxssrazr93@gmail.com>
+Date: Thu, 8 Oct 2026 13:49:47 +0530
+Subject: [PATCH 13/14] ruffle_sdl: minimum key hold, so games that poll keys
+ see short taps
+
+gptokeyb sends Start (part of its Select+Start hotkey) as a press and a
+release a few milliseconds apart when the button is released. Flash games
+that read Key.isDown once per frame miss such a tap. A release that comes
+sooner than RUFFLE_MIN_KEY_HOLD_MS (default 100, 0 = off) after its press
+is held back until that time has passed.
+---
+ sdl/src/main.rs | 66 +++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index b2148558..09539e00 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -27,6 +27,7 @@ use ruffle_render_wgpu::descriptors::Descriptors;
+ use ruffle_render_wgpu::target::{RenderTarget, RenderTargetFrame};
+ use sdl2::event::{Event, WindowEvent};
+ use sdl2::mouse::MouseButton as SdlMouseButton;
++use std::collections::HashMap;
+ use std::cell::Cell;
+ use std::path::PathBuf;
+ use std::rc::Rc;
+@@ -483,8 +484,37 @@ fn main() -> anyhow::Result<()> {
+         .and_then(|v| v.parse().ok())
+         .unwrap_or(0.01);
+ 
++    // Minimum key hold (RUFFLE_MIN_KEY_HOLD_MS, default 100, 0 = off). gptokeyb sends some
++    // buttons (Start, because of the Select+Start hotkey) as a press and release a few ms apart,
++    // on the button's release. Games that poll Key.isDown once per frame miss such a tap, so a
++    // release that comes sooner than this after its press is held back until the time is up.
++    let min_hold = Duration::from_millis(
++        std::env::var("RUFFLE_MIN_KEY_HOLD_MS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(100),
++    );
++    let mut key_down_at: HashMap<String, Instant> = HashMap::new();
++    let mut held_ups: Vec<(Instant, String, PlayerEvent)> = Vec::new();
++
+     'main: loop {
+-        let wait = next_frame.saturating_duration_since(Instant::now());
++        // releases held back by the minimum key hold that are now due
++        if !held_ups.is_empty() {
++            let now = Instant::now();
++            let mut player = player.lock().expect("player lock");
++            held_ups.retain(|(due, _, event)| {
++                if *due <= now {
++                    player.handle_event(event.clone());
++                    false
++                } else {
++                    true
++                }
++            });
++        }
++        let mut wait = next_frame.saturating_duration_since(Instant::now());
++        if let Some((due, _, _)) = held_ups.iter().min_by_key(|(due, _, _)| *due) {
++            wait = wait.min(due.saturating_duration_since(Instant::now()));
++        }
+         let first = if wait.is_zero() {
+             events.poll_event()
+         } else {
+@@ -500,18 +530,40 @@ fn main() -> anyhow::Result<()> {
+                     scancode,
+                     keycode,
+                     keymod,
++                    repeat,
+                     ..
+-                } => PlayerEvent::KeyDown {
+-                    key: keys::key_descriptor(scancode, keycode, keymod),
+-                },
++                } => {
++                    let id = format!("{scancode:?}{keycode:?}");
++                    // a new press of a key whose release is still held back: release it first
++                    if let Some(i) = held_ups.iter().position(|(_, held, _)| *held == id) {
++                        let (_, _, up) = held_ups.remove(i);
++                        player.lock().expect("player lock").handle_event(up);
++                    }
++                    if !repeat {
++                        key_down_at.insert(id, Instant::now());
++                    }
++                    PlayerEvent::KeyDown {
++                        key: keys::key_descriptor(scancode, keycode, keymod),
++                    }
++                }
+                 Event::KeyUp {
+                     scancode,
+                     keycode,
+                     keymod,
+                     ..
+-                } => PlayerEvent::KeyUp {
+-                    key: keys::key_descriptor(scancode, keycode, keymod),
+-                },
++                } => {
++                    let id = format!("{scancode:?}{keycode:?}");
++                    let up = PlayerEvent::KeyUp {
++                        key: keys::key_descriptor(scancode, keycode, keymod),
++                    };
++                    match key_down_at.remove(&id) {
++                        Some(at) if !min_hold.is_zero() && at.elapsed() < min_hold => {
++                            held_ups.push((at + min_hold, id, up));
++                            continue;
++                        }
++                        _ => up,
++                    }
++                }
+                 Event::TextInput { text, .. } => {
+                     let mut player = player.lock().expect("player lock");
+                     for codepoint in text.chars() {
