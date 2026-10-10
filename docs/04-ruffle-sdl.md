@@ -9,7 +9,7 @@ Read this when you are about to build, run, debug or ship the `ruffle_sdl` binar
 `ruffle_sdl` is a new workspace crate (`sdl/`) added to Ruffle by patch 0006. It replaces the combination of "desktop Ruffle inside a Weston/X11 compositor wrapper" with one small native binary.
 
 * It links only `libSDL2`, `libasound` and glibc (plus libdl, libgcc_s, libpthread, libm). No X11, no Wayland, no Weston, no OpenSSL, no fontconfig, no OpenH264.
-* The stripped aarch64 binary was about 16.7 MB in the port this series came from (the desktop build it replaced was 32 to 34 MB). That figure was not remeasured with the toolkit's build script. The glibc floor is 2.30 (see below).
+* The stripped aarch64 binary is about 16.7 MB (16,724,224 bytes when built with the toolkit's `ruffle/build-aarch64.sh` from the 0001 to 0013 series; the desktop build it replaced was 32 to 34 MB). The glibc floor is 2.30 (see below).
 * It uses the SDL2 and GLES 3.0 the firmware already ships. Knulli ships SDL 2.32.8, muOS 2601 ships SDL 2.28.5, and the supported floor is SDL 2.0.10.
 * Source layout: `sdl/src/main.rs` (window, GL, loop, input, CLI), `keys.rs` (SDL scancode and keycode to Ruffle key, with left, right and numpad locations), `audio.rs` (SDL audio with fallbacks).
 * Saves use the same storage code as desktop Ruffle (`saves/localhost/<name>.sol`), so switching front ends keeps progress.

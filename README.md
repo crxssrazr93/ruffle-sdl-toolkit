@@ -78,7 +78,8 @@ This section is maintained by hand. Update it when you verify something.
 |-|-|-|
 | Patch series 0001 to 0013 applies to the pinned commit | verified | `ruffle/fetch.sh` applies it cleanly on the pinned commit |
 | x86_64 `ruffle_sdl` build from the series | verified | release build, about 3.5 minutes |
-| aarch64 build (Docker) and glibc floor | partly verified | `atftool` built for aarch64 in Docker with a glibc 2.30 floor, 652 KB. The `ruffle_sdl` aarch64 build script has not been run yet in this session |
+| aarch64 build (Docker) and glibc floor | verified | `ruffle/build-aarch64.sh` built `ruffle_sdl` from the 0001 to 0013 series: 16.7 MB, max GLIBC_2.30, needs libSDL2, libasound, libdl, libgcc_s, libpthread, libm, libc. The script fails above `MAX_GLIBC` (default 2.30). `atftool` also built for aarch64 (652 KB, glibc 2.30) |
+| aarch64 binary under qemu | verified for start and exit | The toolkit built `ruffle_sdl` ran the relaunch fixture under qemu user mode: started, ran the AVM1 movie, printed `RUFFLE_RELAUNCH next`, exit 0. Emulation only, no GPU, no real handheld |
 | `tools/swf` tests | verified | 5 tests pass |
 | `tools/delivery` test | verified | passes using xdelta3 in a Docker alpine container |
 | `atftool` tests | verified | 14 cargo tests pass |
