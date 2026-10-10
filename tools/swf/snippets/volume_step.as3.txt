@@ -1,0 +1,32 @@
+// Volume step helper (AS3)
+//
+// Handheld buttons cannot drag a slider. Map two shoulder buttons (gptokeyb sends keys,
+// for example m and n, keyCode 77 and 78) to a step through 100%, 50%, 0%, persist it, and
+// show a short fading note.
+//
+// PITFALL: never send exactly 0 to a game audio API. Some games treat 0 as "pause" without
+// touching the volume, so raising it later never resumes. Send a tiny positive value.
+//
+// Needs:  import flash.media.SoundMixer;   import flash.media.SoundTransform;
+
+private static const VOLUME_STEPS:Array = [1.0, 0.5, 0.0];
+private var musicStep:int = 0;
+
+private function stepMusicVolume() : void
+{
+   this.musicStep = (this.musicStep + 1) % VOLUME_STEPS.length;
+   this.applyMusicVolume(VOLUME_STEPS[this.musicStep]);
+   this.saveVolumeStep();               // reuse sharedobject_save.as3.txt
+   this.showNote("Music " + Math.round(VOLUME_STEPS[this.musicStep] * 100) + "%");
+}
+
+private function applyMusicVolume(v:Number) : void
+{
+   var safe:Number = Math.max(v, 0.001);   // never exactly 0
+   // game specific: pass `safe` to the game's own setMusic or SoundTransform
+   SoundMixer.soundTransform = new SoundTransform(safe);
+}
+
+// hook in the existing key handler:
+//   if(e.keyCode == 77) { this.stepMusicVolume(); }     // m, from L1
+//   if(e.keyCode == 78) { this.stepSoundVolume(); }     // n, from L2 (same pattern)

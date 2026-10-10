@@ -1,0 +1,42 @@
+// SharedObject save (AS3), replacing file or cloud saves
+//
+// Ruffle stores SharedObjects per SWF URL, and that URL differs between firmwares and
+// between a symlinked and a real path. Passing "/" as the local path makes the key
+// independent of where the SWF lives. Use ONE save object from the shell for all sub movies
+// so progress survives a relaunch.
+// Run the front end with a fixed --save-directory so the .sol files stay inside the port.
+//
+// Needs:  import flash.net.SharedObject;
+
+private static const SAVE_NAME:String = "mygame_save";   // choose once, never change
+
+// the AIR code usually has  fileWrite(name, bytes)  and  fileRead(name):  keep that shape
+private function fileWrite(fileName:String, value:Object) : Boolean
+{
+   try
+   {
+      var so:SharedObject = SharedObject.getLocal(SAVE_NAME, "/");
+      so.data[fileName] = value;
+      so.flush();
+      return true;
+   }
+   catch(e:Error)
+   {
+      trace("save failed: " + e.message);
+   }
+   return false;
+}
+
+private function fileRead(fileName:String) : Object
+{
+   try
+   {
+      var so:SharedObject = SharedObject.getLocal(SAVE_NAME, "/");
+      return so.data[fileName];
+   }
+   catch(e:Error)
+   {
+      trace("load failed: " + e.message);
+   }
+   return null;
+}

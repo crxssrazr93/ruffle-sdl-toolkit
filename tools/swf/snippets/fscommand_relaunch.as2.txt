@@ -1,0 +1,20 @@
+// fscommand relaunch (AS1/AS2)
+//
+// Same protocol as the AS3 version: the front end prints  RUFFLE_RELAUNCH <args>  and exits,
+// run-ruffle restarts it with the new flashvars. In AS2 the call is the global fscommand.
+//
+//    fscommand("relaunch", "world2 level3 0");
+//    fscommand("quit", "");
+//
+// In P-code (AS2 SWFs are patched as P-code, not recompiled) a call looks like:
+//
+//    Push "world2 level3 0", "relaunch"   // arguments pushed last to first
+//    Push 2, "fscommand"                  // argument count, then the function name
+//    CallFunction
+//    Pop
+//
+// Check the exact operand order against an existing fscommand or getURL call in the same
+// export before writing it: copy the shape of a call that is already in the file.
+//
+// Save state first (SharedObject.getLocal("mygame_save", "/"), then flush()) because the
+// process exits straight away.

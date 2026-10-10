@@ -1,0 +1,33 @@
+// Manifest based directory listing (AS3)
+//
+// AIR code lists a folder with File.getDirectoryListing() or hands a File directory to an
+// asset manager. Neither works in Ruffle (no filesystem API). Generate the listing at BUILD
+// time and compile it into the SWF as a static table, then enqueue relative URLs.
+//
+// 1. Build time: a script walks your own copy of the game data and prints, per folder, the
+//    files that exist (tools/delivery/make_manifest.sh gives md5 and paths you can reuse;
+//    a small python loop that writes the AS3 below is enough).
+// 2. Patch time: the anchor.py patch inserts the generated table and swaps the call.
+// 3. Convert names while generating when assets are converted on device, for example a
+//    texture "a.atf" becomes "a.png" with the same atlas "a.xml".
+
+private static const FILES:Object = {
+   "assets/level1": ["atlas.xml", "atlas.png", "bg.png"],
+   "assets/level2": ["atlas.xml", "atlas.png"]
+};
+
+// before:  assets.enqueue(File.applicationDirectory.resolvePath("assets/level1"));
+// after:
+private function enqueueFolder(assets:Object, folder:String) : void
+{
+   var list:Array = FILES[folder];
+   if(list == null) { trace("no manifest entry for " + folder); return; }
+   for(var i:int = 0; i < list.length; i++)
+   {
+      assets.enqueue(folder + "/" + list[i]);       // relative URL, resolved against the SWF
+   }
+}
+
+// remaining  File.applicationDirectory.resolvePath("x")  calls become plain strings: "x"
+// (relative to the root movie in Ruffle, not to the loaded sub SWF: a sub SWF that loads
+//  "OtherStuff/..." needs that folder moved next to the root movie)

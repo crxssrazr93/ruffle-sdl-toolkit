@@ -1,0 +1,25 @@
+// flashvar boot (AS3 shell)
+//
+// The front end passes flashvars with  -P key=value  (desktop Ruffle: --flashvars
+// "a=1&b=2"). The shell reads them from loaderInfo.parameters, which also gives
+// deterministic start points for tests and carries state across a relaunch.
+//
+// Put this after super() in the document class constructor, or in an ADDED_TO_STAGE handler
+// (loaderInfo is not valid before the display object exists).
+
+private var bootMovie:String = "";
+private var bootLevel:String = "";
+private var bootDoor:int = 0;
+private var bootAspect:String = "extend";
+
+private function readBootParameters() : void
+{
+   var fv:Object = this.loaderInfo.parameters;
+   if(fv.game != undefined)   { this.bootMovie  = String(fv.game); }
+   if(fv.level != undefined)  { this.bootLevel  = String(fv.level); }
+   if(fv.door != undefined)   { this.bootDoor   = int(fv.door); }
+   if(fv.aspect != undefined) { this.bootAspect = String(fv.aspect); }   // fit | fill | extend
+}
+
+// Then branch on bootMovie in the place that used to show the main menu:
+//    if(this.bootMovie != "") { this.loadMovie(this.bootMovie, this.bootLevel, this.bootDoor); return; }

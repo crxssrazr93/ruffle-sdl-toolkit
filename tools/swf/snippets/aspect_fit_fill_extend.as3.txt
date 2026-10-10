@@ -1,0 +1,93 @@
+// Aspect modes skeleton (AS3 shell): fit, fill, extend
+//
+// Run the front end with --stage-scale movie so Stage settings are honoured and the shell
+// does its own fitting. Ruffle's fullScreenSourceRect is a stub, do not rely on it.
+//
+//   fit     keep the original ratio, black bars on the long side (nothing cropped)
+//   fill    keep the original ratio, scale to cover, the long side is cropped
+//   extend  keep the scale of "fit" but give the game the real screen size, so the content
+//           shows more world on a wider or taller screen (the game must support a variable
+//           view size, audit every constant that assumed the original stage height)
+//
+// Needs:  import flash.display.*;   import flash.events.Event;
+
+private var originalW:Number = 640;    // the SWF's design size (see swf_info.py)
+private var originalH:Number = 480;
+private var aspectMode:String = "extend";
+private var gameRoot:DisplayObject;    // the container that holds the game
+private var backdrop:Shape;            // below the game
+private var bars:Shape;                // ABOVE the game: art spills outside the stage rect
+
+private function setupAspect() : void
+{
+   stage.scaleMode = StageScaleMode.NO_SCALE;
+   stage.align = StageAlign.TOP_LEFT;
+   this.backdrop = new Shape();
+   this.bars = new Shape();
+   stage.addChildAt(this.backdrop, 0);
+   stage.addChild(this.bars);
+   stage.addEventListener(Event.RESIZE, this.onAspectResize);
+   this.onAspectResize(null);
+}
+
+private function onAspectResize(e:Event) : void
+{
+   var sw:Number = stage.stageWidth;
+   var sh:Number = stage.stageHeight;
+   var sx:Number = sw / this.originalW;
+   var sy:Number = sh / this.originalH;
+   var scale:Number = (this.aspectMode == "fill") ? Math.max(sx, sy) : Math.min(sx, sy);
+
+   // size of the game rectangle in screen pixels, and where it sits
+   var gw:Number = this.originalW * scale;
+   var gh:Number = this.originalH * scale;
+   var gx:Number = 0;
+   var gy:Number = 0;
+   if(this.aspectMode == "fit")
+   {
+      gx = (sw - gw) / 2;
+      gy = (sh - gh) / 2;
+   }
+   else if(this.aspectMode == "fill")
+   {
+      gx = (sw - gw) / 2;     // negative: sides are cropped
+      gy = (sh - gh) / 2;
+   }
+   else
+   {
+      // extend: x stays 0. Centering would push the world sideways on screens wider than the
+      // game and cut the right edge. The game receives the extended size instead:
+      //    game.setDimensions(sw / scale, sh / scale);
+      gw = sw;
+      gh = sh;
+   }
+   this.gameRoot.scaleX = this.gameRoot.scaleY = scale;
+   this.gameRoot.x = gx;
+   this.gameRoot.y = gy;
+
+   // backdrop: the colour the SWF declares as its background (levels may rely on it, a black
+   // backdrop makes a black character invisible). Only paint black OUTSIDE the game rect.
+   var g:Graphics = this.backdrop.graphics;
+   g.clear();
+   g.beginFill(0x000000);
+   g.drawRect(0, 0, sw, sh);
+   g.endFill();
+   g.beginFill(0xFFFFFF);           // the original stage colour
+   g.drawRect(Math.max(0, gx), Math.max(0, gy), Math.min(gw, sw), Math.min(gh, sh));
+   g.endFill();
+
+   // black frame ABOVE the content for fit (Flash does not clip to the stage rect, art can
+   // spill over the bars). Four plain rects are safer than a rect with a hole (holes depend
+   // on the renderer's fill rule).
+   var b:Graphics = this.bars.graphics;
+   b.clear();
+   if(this.aspectMode == "fit")
+   {
+      b.beginFill(0x000000);
+      b.drawRect(0, 0, sw, gy);                       // top
+      b.drawRect(0, gy + gh, sw, sh - gy - gh);       // bottom
+      b.drawRect(0, gy, gx, gh);                      // left
+      b.drawRect(gx + gw, gy, sw - gx - gw, gh);      // right
+      b.endFill();
+   }
+}

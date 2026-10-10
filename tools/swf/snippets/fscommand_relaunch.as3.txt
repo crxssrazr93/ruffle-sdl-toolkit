@@ -1,0 +1,34 @@
+// fscommand relaunch (AS3 shell)
+//
+// Ruffle never frees the library of an unloaded movie, so a shell that loads many sub SWFs
+// grows until a small device runs out of memory. The cure is one process per sub movie:
+// save, ask the front end to restart with new arguments, and exit.
+//
+// Protocol: fscommand("relaunch", "<args>") makes ruffle_sdl print a stdout line
+//     RUFFLE_RELAUNCH <args>
+// and exit. The run-ruffle wrapper reads that line and starts the binary again with the
+// new flashvars. Keep <args> as space separated tokens without quotes.
+//
+// Needs:  import flash.system.fscommand;   import flash.net.SharedObject;
+
+private function switchMovie(movie:String, level:String, door:int) : void
+{
+   // 1. persist everything the next process needs (SharedObject, see sharedobject_save.as3.txt)
+   this.saveGameData();
+   // 2. the front end restarts itself with these arguments, parsed by flashvar_boot.as3.txt
+   fscommand("relaunch", movie + " " + level + " " + door);
+}
+
+// Make any "preload the next movie" function a no op, otherwise the library you are trying
+// to avoid is loaded just before the restart.
+private function preloadNext() : void
+{
+   return;
+}
+
+// quit without relaunch
+private function quitGame() : void
+{
+   this.saveGameData();
+   fscommand("quit");
+}

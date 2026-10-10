@@ -1,0 +1,24 @@
+// Aspect notes for AS1/AS2 movies (no recompile, P-code route)
+//
+// AS2 worlds are patched as P-code (see README), so keep the change small: let the AS3 shell
+// own the scaling (see aspect_fit_fill_extend.as3.txt) and give the AS2 movie only the
+// variable view size it already supports (often scaledStageWidth / scaledStageHeight).
+//
+// Checklist when you add extend to an AS2 game:
+//   1. Find the camera scroll rect. If only the width was grown for narrow screens, grow the
+//      height too (duplicate the SetMember for ScrollRect.height with scaledStageHeight).
+//   2. grep for constants that assume the original view height (death line, camera bounds,
+//      pause overlays). Express them relative to the stage: 700 becomes scaledStageHeight + 220.
+//   3. Camera clamp: never scroll below the level bottom, show the extra height above it, and
+//      align short rooms to their floor (MaxY = MinY + stageY).
+//   4. Pause or dialog overlays cover only the original height: add a black fill when
+//      scaledStageHeight is larger (attach a clip at a high depth, draw black).
+//   5. Check every SWF separately: bounds come from fixed level data in one, from a marker in
+//      another.
+//
+// P-code shape of a patch (literal anchors, new labels for new branches):
+//    Push "ScrollRect"
+//    GetVariable
+//    Push "width", "scaledStageWidth"
+//    ...
+// copy the ScrollRect height assignment next to it, using "height" and "scaledStageHeight".

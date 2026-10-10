@@ -1,0 +1,24 @@
+// Report the real stage size instead of the monitor size (AS3)
+//
+// AIR shells ask Capabilities.screenResolutionX/Y or stage.nativeWindow.width/height for the
+// screen size. Under Ruffle (and under Xvfb or a compositor with a window smaller than the
+// screen) these do not match the drawing area. stage.stageWidth / stageHeight, with
+// StageScaleMode.NO_SCALE, is the size of the render surface and is what the layout needs.
+//
+// Minimum size: report this to the game as the smallest stage it should be laid out for, so
+// a small handheld screen (for example 640x480) never gets a layout built for more room.
+
+private var minStageW:Number = 640;
+private var minStageH:Number = 480;
+
+private function reportedStageSize() : Object
+{
+   var w:Number = Math.max(stage.stageWidth, this.minStageW);
+   var h:Number = Math.max(stage.stageHeight, this.minStageH);
+   return {width: w, height: h};
+}
+
+// replace:  Capabilities.screenResolutionX      ->  stage.stageWidth
+//           Capabilities.screenResolutionY      ->  stage.stageHeight
+//           stage.nativeWindow.width / height   ->  stage.stageWidth / stageHeight
+//           stage.displayState = FULL_SCREEN_INTERACTIVE  ->  remove (the front end is full screen)
