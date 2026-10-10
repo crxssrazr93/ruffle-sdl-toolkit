@@ -925,7 +925,7 @@ index 00000000..5ac9cc38
 +    };
 +
 +    // The collector frees garbage, but glibc keeps the freed memory: a game that builds a lot of
-+    // temporary objects (Offspring Fling parses every level's XML at start) then holds hundreds of
++    // temporary objects (a large game parses every level's XML at start) then holds hundreds of
 +    // MB it does not use. Give it back every couple of seconds (RUFFLE_TRIM_SECS, 0 = never).
 +    let trim_every = Duration::from_secs_f64(
 +        std::env::var("RUFFLE_TRIM_SECS")
@@ -936,7 +936,7 @@ index 00000000..5ac9cc38
 +    let mut last_trim = Instant::now();
 +    // A tick longer than this (RUFFLE_GC_LONG_TICK seconds, 0 = off) is a load: the game's init()
 +    // and every level start build and drop hundreds of MB inside one tick. One full collection and
-+    // a malloc_trim right after such a tick return that memory at once (Offspring Fling: 620 -> 400 MB)
++    // a malloc_trim right after such a tick return that memory at once (one large game: 620 -> 400 MB)
 +    // instead of over the next hundred ticks of the 1% push.
 +    let long_tick = Duration::from_secs_f64(
 +        std::env::var("RUFFLE_GC_LONG_TICK")
@@ -955,7 +955,7 @@ index 00000000..5ac9cc38
 +        Instant::now(),
 +    );
 +    // Extra collector work per tick, as a fraction of a full cycle (RUFFLE_GC_STEP, 0 = off).
-+    // 1% kept Offspring Fling at its live size (~560 MB on PC instead of 750+) at no frame cost.
++    // 1% kept a large game at its live size (~560 MB on PC instead of 750+) at no frame cost.
 +    let gc_step: f64 = std::env::var("RUFFLE_GC_STEP")
 +        .ok()
 +        .and_then(|v| v.parse().ok())
