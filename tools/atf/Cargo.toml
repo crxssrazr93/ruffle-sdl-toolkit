@@ -1,0 +1,28 @@
+[package]
+name = "atftool"
+version = "0.1.0"
+edition = "2021"
+description = "Converts Adobe ATF textures (including lossy ATF v3) to PNG, extracts ATF from SWF, inflates SWF, scales Starling atlas XML"
+license = "MIT"
+
+[lib]
+name = "atftool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atftool"
+path = "src/main.rs"
+
+[dependencies]
+jpegxr = { git = "https://github.com/ruffle-rs/jpegxr", rev = "86cc1749d493288f53d7290ac3eb7082c475b5d9" }
+lzma-rs = "0.3"
+texture2ddecoder = "0.1.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+flate2 = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
