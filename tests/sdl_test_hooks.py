@@ -409,14 +409,14 @@ EDITS = [
         "    let target = SdlTarget {\n        gl,\n",
     ),
     (
-        "    'main: loop {\n        let wait = next_frame.saturating_duration_since(Instant::now());\n",
+        "    'main: loop {\n        // releases held back by the minimum key hold that are now due\n",
         "    let mut hooks = test_hooks::Hooks::from_env(); // RUFFLE_SDL_TEST_HOOKS\n"
         "    'main: loop {\n"
         "        // RUFFLE_SDL_TEST_HOOKS: keys from the RUFFLE_SDL_KEYS file\n"
         "        for key_event in hooks.poll_keys() {\n"
         "            player.lock().expect(\"player lock\").handle_event(key_event);\n"
         "        }\n"
-        "        let wait = next_frame.saturating_duration_since(Instant::now());\n",
+        "        // releases held back by the minimum key hold that are now due\n",
     ),
     (
         "                player.render();\n                drop(player);\n",

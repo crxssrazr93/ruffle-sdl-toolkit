@@ -1,5 +1,5 @@
 #!/bin/bash
-# gamescope_headless.sh <ruffle_sdl> <swf> <out_dir> [seconds] [extra ruffle_sdl args...]
+# gamescope_headless.sh [--headless | --visible] [--hold SECS] <ruffle_sdl> <swf> <out_dir> [seconds] [extra args...]
 #
 # Same contract as pc_sdl_run.sh, but the X server is the one gamescope brings up with
 # `--backend headless` (Xwayland inside gamescope, drawn on the real GPU through Vulkan
@@ -11,12 +11,36 @@
 #
 # Captures and key injection use the same test hooks as pc_sdl_run.sh (external grabbers
 # such as import fail in gamescope headless, "missing an image filename").
+# Viewing: default is --headless (no output anywhere, the mode for automated runs).
+# --visible is opt in for a human watching a test: gamescope runs with `--backend auto`, a nested
+# window on YOUR desktop session. It keeps the caller's DISPLAY, WAYLAND_DISPLAY and XDG_RUNTIME_DIR
+# (the compositor needs them), so the private runtime dir isolation does not apply in this mode.
+# --hold SECS keeps the window up SECS seconds after the run. Env: VIEW=headless|visible, HOLD.
+# The visible mode is not verified (checking it opens a window), the headless mode is.
+#
 # Output in <out_dir>: shot-001.png ..., run.log, gamescope.log, exit_code.
 #
 # Environment (all optional): RES=640x480, SHOT_AT=2s, EXIT_AFTER_SHOTS=1, KEYS="1:tap Space",
 # MEM_MAX=700M, RUST_LOG, see pc_sdl_run.sh.
 set -u
-[ $# -ge 3 ] || { sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,3p;12,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+VIEW=${VIEW:-headless}; HOLD=${HOLD:-0}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --headless) VIEW=headless ;;
+    --visible) VIEW=visible ;;
+    --hold) shift; HOLD=${1:-} ;;
+    --hold=*) HOLD=${1#--hold=} ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*) echo "unknown option: $1" >&2; usage ;;
+    *) break ;;
+  esac
+  shift
+done
+case "$VIEW" in headless|visible) ;; *) echo "bad VIEW: $VIEW" >&2; exit 2 ;; esac
+case "$HOLD" in ''|*[!0-9]*) echo "--hold needs a number" >&2; exit 2 ;; esac
+[ $# -ge 3 ] || usage
 BIN=$(readlink -f "$1"); SWF=$(readlink -f "$2"); OUT=$3; SECS=${4:-8}
 shift 3; [ $# -gt 0 ] && shift
 EXTRA=("$@")
@@ -53,9 +77,15 @@ chmod +x "$INNER"
 
 RUNNER=()
 [ -n "${MEM_MAX:-}" ] && RUNNER=(systemd-run --user --scope -q -p "MemoryMax=$MEM_MAX")
-env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u XAUTHORITY XDG_RUNTIME_DIR="$XDG" \
-  setsid "${RUNNER[@]}" gamescope --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -- "$INNER" \
-  >"$OUT/gamescope.log" 2>&1 &
+if [ "$VIEW" = visible ]; then
+  # nested window on the user's desktop session, only on request
+  setsid "${RUNNER[@]}" gamescope --backend auto -W "$W" -H "$H" -w "$W" -h "$H" -- "$INNER" \
+    >"$OUT/gamescope.log" 2>&1 &
+else
+  env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u XAUTHORITY XDG_RUNTIME_DIR="$XDG" \
+    setsid "${RUNNER[@]}" gamescope --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -- "$INNER" \
+    >"$OUT/gamescope.log" 2>&1 &
+fi
 GP=$!
 
 if [ -n "${KEYS:-}" ]; then
@@ -81,6 +111,7 @@ if kill -0 "$GP" 2>/dev/null; then
 else
   wait "$GP" 2>/dev/null; echo $? > "$OUT/exit_code"
 fi
+[ "$VIEW" = visible ] && [ "$HOLD" -gt 0 ] && { echo "gamescope_headless: window closed with the run; --hold only delays the cleanup" >&2; sleep "$HOLD"; }
 GP=""
 # ruffle_sdl output is inside gamescope.log (the inner program shares its stdout and stderr)
 cp "$OUT/gamescope.log" "$OUT/run.log"
