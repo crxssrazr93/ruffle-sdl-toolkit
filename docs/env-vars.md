@@ -86,12 +86,16 @@ Owner means who wrote it: K is Knifethrower, C is crxssrazr93, U is upstream or 
 
 ### Test only hooks
 
-These exist only in a tree prepared by `tests/sdl_test_hooks.py` and are not part of the shipped series. Never set them for players.
+These exist only in a tree prepared by `tests/sdl_test_hooks.py` (which adds `sdl/src/test_hooks.rs`) and are not part of the shipped series. Never set them for players. `tests/pc_sdl_run.sh` and `tests/gamescope_headless.sh` set them for you.
 
 | Name | Default | Effect | When to change | Patch or source | Owner |
 |-|-|-|-|-|-|
-| `RUFFLE_SDL_SHOT` | unset | Test only. A `.req` file triggers a PPM capture via `glReadPixels`, and a `.key` file taps a key. | PC automated tests. | `tests/sdl_test_hooks.py` | T (C) |
-| other hook variables added by `tests/sdl_test_hooks.py` | unset | Test only. See that script's header for the exact names. | PC automated tests. | `tests/sdl_test_hooks.py` | T (C) |
+| `RUFFLE_SDL_SHOT` | unset (no capture) | Where PNG captures go: a directory (`shot-001.png`, ...), a `%d` or `%03d` pattern, or a file name (later captures get `-N` before the extension). | PC automated tests. | `tests/sdl_test_hooks.py` | T (C) |
+| `RUFFLE_SDL_SHOT_AT` | `60` when `RUFFLE_SDL_SHOT` is set | Comma separated capture points, render frame numbers or seconds with an `s` suffix (`60,2.5s,10s`). | Pick the moment to capture. | `tests/sdl_test_hooks.py` | T (C) |
+| `RUFFLE_SDL_KEYS` | unset | File polled for new lines `down <key>`, `up <key>`, `tap <key>` (tap releases after 150 ms). Key names are SDL names, lowercase and `enter` or `esc` also work. | Scripted key input without a device. | `tests/sdl_test_hooks.py` | T (C) |
+| `RUFFLE_SDL_EXIT_AFTER_SHOTS` | unset | `1` quits once every capture point has been saved. | Short capture runs. | `tests/sdl_test_hooks.py` | T (C) |
+
+Variables of the harness scripts themselves (not read by the player): `RES` (default `640x480`), `SHOT_AT` (default `2s`), `EXIT_AFTER_SHOTS` (default `0`), `KEYS`, `MEM_MAX`, `DNUM` (first display number to try, default 90), `RUST_LOG` (default `warn,ruffle_sdl=info,avm_trace=info`), `VIEW`, `VNC_PORT` (default 5990) and `HOLD`. See [10 Testing](10-testing.md).
 
 ### Planned software cursor (optional patch 0100)
 

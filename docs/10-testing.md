@@ -16,51 +16,98 @@ Tools named here live under `tests/` (see `tests/README.md` for the exact usage 
 
 ## PC harness on Xvfb
 
-`tests/pc_sdl_run.sh <ruffle_sdl> <port dir> <WxH> <game> <level> <seconds> <out prefix> [steps...]`
+```
+tests/pc_sdl_run.sh [--headless | --visible[=auto|xephyr|vnc]] [--vnc-port N] [--hold SECS] \
+    <ruffle_sdl> <swf> <out_dir> [seconds] [extra ruffle_sdl args]
+RES=640x480 SHOT_AT=2s,4s KEYS="1:tap Space;3:down Left;4:up Left" MEM_MAX=700M \
+    tests/pc_sdl_run.sh ./ruffle_sdl tests/fixtures/test_loop.swf /tmp/run1 6
+```
 
-* Starts `Xvfb :NN -screen 0 WxHx24 +extension GLX` on a free private display (find one with `while [ -e /tmp/.X$D-lock ]`), waits for `xdpyinfo` (up to 20 s) and aborts if it never answers.
-* Runs the front end with `env -u WAYLAND_DISPLAY SDL_VIDEODRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy`.
-* Steps: `shot` (capture a PNG), `s:N` (sleep N seconds), `tap:KEY` (tap an SDL key name, Start is `space`).
-* Environment: `ASPECT` (default extend), `DNUM` (display number, so two runs can go in parallel).
-* Ends every process with SIGKILL from a trap.
+* Positional arguments: the binary, the SWF, an output folder, an optional time limit in seconds (default 6) and then any extra arguments, which go to `ruffle_sdl` before the SWF path. Flashvars therefore use the normal `-P` option, for example `tests/pc_sdl_run.sh ./ruffle_sdl game.swf /tmp/run1 20 --stage-scale movie -Pkey=value`.
+* It starts `Xvfb :NN +extension GLX` on a free private display (found with a lock file and socket check, first try `DNUM`, default 90), waits for `xdpyinfo` and aborts with exit 3 if the display never answers.
+* It runs the binary with `SDL_VIDEODRIVER=x11`, `SDL_VIDEO_X11_FORCE_EGL=1`, `LIBGL_ALWAYS_SOFTWARE=1`, `SDL_AUDIODRIVER=dummy`, a private `XDG_RUNTIME_DIR` and the caller's `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY` dropped. It passes `--width`, `--height` (from `RES`) and a `--save-directory` inside the output folder.
+* It waits for the time limit or for the process to end by itself (quit, relaunch, `EXIT_AFTER_SHOTS`), then ends everything with SIGKILL from a trap.
+* Output folder: `shot-001.png` and so on, `run.log` (stdout and stderr, so AS trace lines and the `RUFFLE_RELAUNCH` marker line are in it), `xvfb.log`, `keys.txt` (the key script as the hook saw it), `exit_code` (the exit status, or `killed` when the time ran out) and `saves/`.
 
-Use it for layout, aspect, input and logic. It uses llvmpipe, so it says nothing about speed. A direct level entry needs flashvars (`--stage-scale movie --quality low -Paspect=extend -Pgame=... -Plevel=...`). Flashvar names are per game; the approach is generic. A missing level SWF gives a white screen, and starting some AS3 hubs directly also shows white. Neither is a regression.
+Environment variables:
 
-Build the x86_64 front end with `ruffle/build-x86_64.sh <src> <out>`, from the same patched tree, using your own `CARGO_TARGET_DIR`. Run cargo from inside the source tree. Running it from elsewhere builds into another target folder and you then test a stale binary.
+| Variable | Meaning |
+| --- | --- |
+| `RES=WxH` | screen and window size, default `640x480` |
+| `SHOT_AT=<list>` | capture points, default `2s` (see the hook table below) |
+| `EXIT_AFTER_SHOTS=1` | end the run once every capture is saved, default `0` |
+| `KEYS="<s>:<line>;..."` | key script: seconds after start, then `down`, `up` or `tap` and a key name, items separated by semicolons |
+| `MEM_MAX=700M` | wrap the run in `systemd-run --user --scope -p MemoryMax=...` |
+| `DNUM` | first display number to try, so two runs can be started apart |
+| `RUST_LOG` | default `warn,ruffle_sdl=info,avm_trace=info` |
+| `VIEW`, `VNC_PORT`, `HOLD` | environment forms of `--visible`, `--vnc-port` and `--hold` |
 
-Read ActionScript `trace` output with `RUST_LOG=warn,avm_trace=info`.
+Use it for layout, aspect, input and logic. It uses llvmpipe, so it says nothing about speed. Flashvar names are per game, the approach is generic. A missing level SWF gives a white screen, and starting some AS3 hubs directly also shows white. Neither is a regression.
+
+A binary built without the hooks still runs (good for exit codes and the relaunch marker), it just takes no screenshots.
+
+Build the x86_64 front end with `ruffle/build-x86_64.sh <src> <out>` from the same patched tree. Run cargo from inside the source tree. Running it from elsewhere builds into another target folder and you then test a stale binary.
+
+Read ActionScript `trace` output with `RUST_LOG=warn,avm_trace=info` (already in the default).
+
+### Watching a run: `--headless` and `--visible`
+
+`--headless` is the default and is the only mode to use for automated runs, CI and anything unattended. Nothing is shown anywhere. The two viewing modes below are opt in, for a person who wants to watch a test, for example to see why a scripted key sequence does not do what it should. They never run by accident, and a test script must not pass them.
+
+| Flag | What happens | When a human would use it | Status |
+| --- | --- | --- | --- |
+| `--visible=vnc` | the X server stays Xvfb (no window) and `x11vnc` serves it on `127.0.0.1` only, with a random password written to `<out_dir>/vnc.pass`. Connect with `vncviewer localhost:<port>` | the machine has no spare desktop, you are on a remote shell, or you want to watch without any window appearing on your own screen until you choose to connect | verified: the server starts, listens on localhost only and is cleaned up |
+| `--visible=xephyr` | the X server is Xephyr, a nested window on your desktop. Only the Xephyr process sees your desktop, the test program only sees the nested display | the quickest way to see the game live on a local desktop | not verified, Xephyr is not installed on the author's machine |
+| `--visible` (same as `--visible=auto`) | Xephyr if it is installed and a desktop display exists, otherwise vnc | when you do not care which | follows the two rows above |
+| `--vnc-port N` | first port to try for vnc (default 5990), the next free port is used | only when 5990 is taken or must match a firewall rule | |
+| `--hold SECS` | keep the display and the viewer up for SECS after the run ends | to look at the last frame before the display disappears | |
+
+Notes: `x11vnc` refuses to start when it sees a Wayland session, even for a private X display, so the script runs it with `XDG_SESSION_TYPE=x11` and `WAYLAND_DISPLAY` unset. The VNC server is localhost only with a password, so it is not reachable from the network. In `--visible=xephyr` mode the desktop display is deliberately kept for the Xephyr process alone, which is the only exception to the no desktop window rule, and it applies only when you ask for it.
 
 ## The test only capture hook
 
-External grabbers show black for the GL output (see the dead ends below). So the harness captures inside the process.
+External grabbers show black for the GL output (see the dead ends below). So the capture happens inside the process.
 
-`tests/sdl_test_hooks.py <ruffle src dir>` patches `sdl/src/main.rs` with two test only features (revert with `git checkout -- sdl/src/main.rs` so it never ships):
+```
+python3 tests/sdl_test_hooks.py <ruffle source dir>
+```
 
-* Capture: touching `<prefix>.ppm.req` makes the loop call `glReadPixels` on the window (read framebuffer 0) just before `gl_swap_window()` and write a P6 PPM, rows flipped. The runner waits about 1.5 s, then converts to PNG with ImageMagick.
-* Keys: writing an SDL key name into `<prefix>.ppm.key` taps it, KeyDown now and KeyUp 150 ms later (through the minimum key hold queue).
+The script patches `sdl/src/main.rs` of a tree that already has the `ruffle/patches` series and adds a new file `sdl/src/test_hooks.rs`. It is idempotent (a second run says "already applied"), fails with exit 1 if an anchor matches zero or several times, and is undone with `git checkout -- sdl/src/main.rs && rm sdl/src/test_hooks.rs`. Never ship a binary built from a hooked tree: build it in a scratch checkout. It is a source patch, not a Cargo feature.
 
-The hook is gated by the environment variable `RUFFLE_SDL_SHOT=<prefix>.ppm`. It is not a Cargo feature, only a source patch.
+The hooked binary reads these environment variables (all optional, `pc_sdl_run.sh` and `gamescope_headless.sh` set them for you from `SHOT_AT`, `KEYS` and `EXIT_AFTER_SHOTS`):
 
-Critical detail: before `glReadPixels`, save, reset and restore the GL pixel pack state. Levels that use `BitmapData.colorTransform` or brightness filters make wgpu read back through a pixel pack buffer and leave `PIXEL_PACK_BUFFER` bound and `PACK_ROW_LENGTH` set. Then:
+| Variable | Meaning |
+| --- | --- |
+| `RUFFLE_SDL_SHOT=<dir, file or pattern>` | where PNG captures go. A directory gets `shot-001.png`, `shot-002.png`. A `%d` or `%03d` pattern is substituted. A plain file name gets the first capture as is and later ones as `<stem>-N.<ext>`. Unset means no captures |
+| `RUFFLE_SDL_SHOT_AT=<list>` | comma separated capture points. A plain integer is a render frame number (1 is the first rendered frame), a number with `s` is seconds since the first render (`60,2.5s,10s`). Default 60 when `RUFFLE_SDL_SHOT` is set |
+| `RUFFLE_SDL_KEYS=<file>` | a file polled once per loop wake up. Each new line is `down <key>`, `up <key>` or `tap <key>` (down now, up 150 ms later). Key names are SDL names (`Space`, `Left`, `Return`, `A`, `Escape`), lowercase and the aliases `enter`, `esc` also work. Append with `echo "down Left" >> file` |
+| `RUFFLE_SDL_EXIT_AFTER_SHOTS=1` | quit once every capture point has been saved |
+
+* The capture is a `glReadPixels` of the window's default framebuffer, taken right after the frame is rendered and before the buffer swap.
+* The PNG is written by a small built in encoder that uses stored deflate blocks, so files are large (about 0.9 MB at 640x480) but the sdl crate gains no dependency. Convert with ImageMagick if you want them small.
+* A `tap` holds the key for 150 ms, which is long enough for games that poll `Key.isDown` (verified with `tests/fixtures/test_keys.swf`).
+
+The pixel pack state fix is the critical detail. Levels that use `BitmapData.colorTransform` or brightness filters make wgpu read textures back through a pixel pack buffer and leave `PIXEL_PACK_BUFFER` bound and `PACK_ROW_LENGTH` set. Then:
 
 * the capture lands in the buffer object and the picture is all zero, and
 * unbinding only the buffer lets a stale row length write past the Vec (a SIGSEGV).
 
-So read `PIXEL_PACK_BUFFER_BINDING`, `PACK_ALIGNMENT`, `PACK_ROW_LENGTH`, `PACK_SKIP_ROWS`, `PACK_SKIP_PIXELS` and the read framebuffer binding, set them to 0, 1, 0, 0, 0 and framebuffer 0, read, and restore all of them (wgpu tracks that state itself).
+So the hook saves `PIXEL_PACK_BUFFER_BINDING`, `PACK_ALIGNMENT`, `PACK_ROW_LENGTH`, `PACK_SKIP_ROWS`, `PACK_SKIP_PIXELS` and the read framebuffer binding, sets them to a clean state (0, 1, 0, 0, 0 and framebuffer 0), reads, and restores all of them (wgpu tracks that state itself).
 
-If a capture is black, suspect your capture first. An hour was lost blaming Mesa and a fade clip before the harness was the cause.
+If a capture is black, suspect the capture first. An hour was lost blaming Mesa and a fade clip before the harness was the cause.
 
 ## Gamescope headless
 
-For GPU accelerated offscreen runs (llvmpipe is too slow for long level walks), use gamescope with its headless backend and a private runtime directory:
+For GPU accelerated offscreen runs (llvmpipe is too slow for long level walks), use `tests/gamescope_headless.sh`. It takes the same positional arguments, environment variables and output files as `pc_sdl_run.sh`, but the X server is the one inside `gamescope --backend headless`, with a private runtime directory:
 
 ```
-export XDG_RUNTIME_DIR="$(mktemp -d)"
-setsid gamescope --backend headless -W 720 -H 720 -w 720 -h 720 -- ./run_inside.sh &
-# stop with: kill -9 -- -<pgid>
+tests/gamescope_headless.sh [--headless | --visible] [--hold SECS] <ruffle_sdl> <swf> <out_dir> [seconds] [extra args]
+SHOT_AT=3s,10s tests/gamescope_headless.sh ./ruffle_sdl game.swf /tmp/run2 15 --stage-scale movie
 ```
 
-Notes: it renders on the real GPU, roughly five times faster or more than Xvfb software GL. It warns "No CAP_SYS_NICE", which is harmless. Inside it you get a `DISPLAY` and no `WAYLAND_DISPLAY`. The generic grabbers (import, x11grab) still do not work there, so use the capture hook. `tests/gamescope_headless.sh` wraps this.
+Notes: it renders on the real GPU through Vulkan, roughly five times faster or more than Xvfb software GL. It warns "No CAP_SYS_NICE" and prints a PipeWire connection error, both harmless. Inside it you get a `DISPLAY` and no `WAYLAND_DISPLAY`. The generic grabbers (import, x11grab) still do not work there, so use the capture hook. The compositor and the player start under `setsid` and are killed as a group with SIGKILL. The output folder has `shot-NNN.png`, `run.log` (a copy of `gamescope.log`, because the player shares gamescope's output), `gamescope.log` and `exit_code`.
+
+Viewing flags: `--headless` is the default and the mode for automated runs. `--visible` (env `VIEW=visible`) is opt in for a person watching a test: gamescope then runs with `--backend auto`, a nested window on your desktop session, and keeps your `DISPLAY`, `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` because the compositor needs them, so the private runtime directory isolation does not apply in this mode. Use it when you want to see the real GPU rendering path live, for example to judge smoothness. `--hold SECS` (env `HOLD`) delays the cleanup after the run. The window closes with the run, so `--hold` does not keep it open for long. The visible mode is not verified, because checking it opens a window. The headless mode is verified.
 
 ## aarch64 under qemu
 
@@ -71,7 +118,14 @@ qemu-aarch64-static -L $SYSROOT $SYSROOT/lib/ld-linux-aarch64.so.1 \
   --library-path "$PORT/lib:$SYSROOT/usr/lib/aarch64-linux-gnu" ./ruffle_sdl ...
 ```
 
-with `LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy` inside a private Xvfb. It takes minutes to the first frame, so it validates startup, glibc and memory behaviour only. `tests/aarch64_qemu_run.sh` wraps it. A qemu run of `ruffle_sdl` itself has not been recorded yet; the recipe was proven on another SDL application. Treat the first run as an experiment.
+with `LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy` inside a private Xvfb. It takes minutes to the first frame, so it validates startup, glibc and memory behaviour only.
+
+```
+tests/aarch64_qemu_run.sh --make-sysroot
+tests/aarch64_qemu_run.sh <aarch64 ruffle_sdl> <swf> <out_dir> [seconds] [extra args]
+```
+
+`--make-sysroot` builds a Debian bookworm arm64 sysroot once with Docker (no root, no binfmt_misc, default folder `~/.cache/ruffle-sdl-toolkit/sysroot-arm64`, override with `SYSROOT`) and takes `qemu-aarch64-static` from the same container when the host has none. The run command calls `pc_sdl_run.sh` with a wrapper that starts the binary through the sysroot loader, so the same environment variables apply (default time limit 60 seconds), plus `SYSROOT`, `QEMU`, `EXTRA_LIBS`, `QEMU_EXTRA` and `GALLIUM_DRIVER`. It does not take the `--visible` flags. Status: verified for starting a real aarch64 `ruffle_sdl` on `test_quit.swf` and exiting with code 0 (Mesa llvmpipe, about 15 seconds). Screenshots under qemu were not run, they need an aarch64 build from a hooked tree.
 
 Pitfalls specific to this path:
 
@@ -108,7 +162,7 @@ API pitfalls:
 
 ### Virtual keyboard from a FIFO (uinput)
 
-`tests/keyd.py` creates a uinput keyboard and reads lines from a FIFO: `<KEY> <ms>` (hold that long) or `sleep <ms>`. It writes a pid file, so you never need `pgrep -f`. Because it bypasses gptokeyb, it separates "the game misses input" from "the gptokeyb mapping is wrong". It works with or without gptokeyb running. Use `KEY_ESC` (there is no `KEY_ESCAPE` in evdev).
+`tests/keyd.py` creates a uinput keyboard and reads lines from a FIFO: `<KEY> <ms>` (hold that long), `down <KEY>`, `up <KEY>`, `sleep <ms>` or `quit`. It writes a pid file, so you never need `pgrep -f`. Because it bypasses gptokeyb, it separates "the game misses input" from "the gptokeyb mapping is wrong". It works with or without gptokeyb running. Use `esc` (there is no `KEY_ESCAPE` in evdev, the script accepts both names). It has not been run in this toolkit's checks (it needs uinput and would type into a desktop).
 
 Other injectors that worked:
 
@@ -138,7 +192,7 @@ Setup test matrix (run each): fresh copy, one PNG deleted, embedded asset delete
 * A device memory sampler records player RSS, GPU driver pages (Mali memory is invisible in RSS), `MemAvailable` and swap every few seconds. Or sample `VmHWM` from `/proc/$PID/status`. A measurement budget on a 1 GB handheld is about 550 to 560 MB free with the frontend resident.
 * Orphans after a kill can hold hundreds of MB of swap and fail the next run. Check `free -m` and `/proc/swaps` before memory runs. `swapoff -a` followed by `swapon -a` does not restore zram. Use `swapon -p 1000 /dev/zram0`.
 * Exit codes from the firmware hotkey: 143 (SIGTERM) and 137 (SIGKILL after SIGTERM was ignored) are normal. An OOM kill is also 137, distinguishable only in the kernel log.
-* `tests/device.sh` takes host, password file and launcher from environment variables, never from constants. It has subcommands for launch, stop, keyd, keys, shot, stat and waitfps. It never runs by default.
+* `tests/device.sh` takes host, password file and launcher from environment variables, never from constants. Its subcommands are `es-games`, `es-reload`, `running`, `launch`, `emukill`, `stop`, `keyd`, `keys`, `fbinfo`, `shot`, `stat`, `log` and `waitlog`. It refuses to run without `DEVICE_OK=1` and has never been run in this toolkit's checks.
 
 ## Process and window hygiene
 
@@ -169,7 +223,7 @@ The quit hotkey makes gptokeyb run `pkill -f <name>`. If the kill name appears i
 * Run every measurement at least twice. Two identical runs scored 40.5 and 43.4 fps, so a "win" of 2.5 fps was noise.
 * Wait until loading finishes (presented frames above about 20 per second) before you measure.
 * Set the governor and power mode explicitly, and note them. A high performance mode changed one result from 15.3 to 16.6 fps. A different firmware changed it again.
-* Frame logs: `RUFFLE_SDL_TIMING=1` (tick, render and swap share every 2 s) and `RUFFLE_FPS_LOG=1` with `RUST_LOG` including `ruffle_core::player::port_fps=info`. Wait for N lines with `tests/device.sh waitfps N`.
+* Frame logs: `RUFFLE_SDL_TIMING=1` (tick, render and swap share every 2 s) and `RUFFLE_FPS_LOG=1` with `RUST_LOG` including `ruffle_core::player::port_fps=info`. Wait for a log line with `tests/device.sh waitlog <regex> [timeout]`.
 * The profilers: `RUFFLE_AS3_PROF=1` for hot AS3 methods, `PM_GPUSTAT=1` for GPU submit counts, `RUFFLE_MEMLOG=1` for memory by category.
 * Bisect without rebuilding: the memory patches have runtime switches (`RUFFLE_DRAW_IN_PLACE=0`, `RUFFLE_ZEROED_PIXELS=0` and others), `SDL_AUDIODRIVER=dummy` isolates audio, `RUST_LOG=warn,wgpu_hal=debug,wgpu_core=debug` counts shaders and programs. See [env-vars.md](env-vars.md).
 * Verify a patched SWF numerically with a trace build (see [08](08-screen-aspect.md)) rather than by eye.

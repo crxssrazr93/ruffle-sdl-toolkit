@@ -92,10 +92,14 @@ Small extras (480x320) are optional for a submission but cheap to run on the PC.
 Never open a window on your desktop. Use Xvfb with a private display, or `gamescope --backend headless`. Details and the capture hook are in [10 Testing](10-testing.md). The short version:
 
 ```
-tests/pc_sdl_run.sh <ruffle_sdl> <port dir> 720x720 <game> <level> 20 out/gp_extend shot
+for aspect in fit fill extend; do
+  RES=720x720 SHOT_AT=5s EXIT_AFTER_SHOTS=1 \
+    tests/pc_sdl_run.sh ./ruffle_sdl MYGAME.swf out/sq_$aspect 20 \
+    --stage-scale movie -Paspect=$aspect
+done
 ```
 
-The runner starts Xvfb at the given size, passes `--width` and `--height` to match, sets the aspect flashvar from the `ASPECT` environment variable, and writes a PNG per `shot` step. Loop over the sizes and the three aspect values, then build a labelled comparison sheet and check:
+`RES` sets the Xvfb screen and the `--width` and `--height` of the player, the SWF and the output folder are positional, and everything after the time limit goes to `ruffle_sdl` (here the `-P` flashvar that your patched shell reads for the aspect mode, see [02](02-shell-patching.md); the flashvar name is whatever your patch defines). `SHOT_AT` picks the capture time, and each run writes `shot-001.png` into its output folder. The runner needs a binary built from a hooked tree, and `EXIT_AFTER_SHOTS=1` ends the run once the capture is saved. Loop over the sizes and the three aspect values, then build a labelled comparison sheet and check:
 
 * the player and HUD are fully visible,
 * no strip of stage colour on the wrong side,
