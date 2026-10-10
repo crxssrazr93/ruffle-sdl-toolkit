@@ -19,10 +19,10 @@ Read this when you turn a patched Flash or AIR game into a PortMaster port: fill
 9. **gptokeyb** (or gptokeyb2 on muOS) with `-c MYPORT.gptk`, watching `ruffle_sdl`.
 10. **`pm_platform_helper "$GAMEDIR/ruffle_sdl"`**. Pass the real binary.
 11. **The `run-ruffle` call** with the front end arguments:
-    `--stage-scale movie --quality "$QUALITY" -Paspect=... -Pfps=... --save-directory "$GAMEDIR/saves" <shell>.swf`.
+    `--stage-scale movie --quality "$QUALITY" -Paspect="$ASPECT" -Pfps="$FRAME_RATE" --save-directory "$GAMEDIR/saves" <shell>.swf`, plus `--render-size "$RENDER_SIZE"` when the cfg sets one. Keep only the `-P` flashvars your patched shell reads.
 12. **`pm_finish`** at the end, and before every error exit. Otherwise PortMaster's cleanup (gptokeyb and so on) is skipped.
 
-Front end arguments, for reference: `--width/--height` (default full screen), `-q/--quality` (low is fastest, no AA; medium, high), `--player-runtime air`, `--save-directory` (required), `-Pkey=value` flashvars, `--render-size WxH`, `--stage-scale fit|movie`. Saves land in `saves/localhost/<name>.sol`, the same storage as desktop Ruffle. Ruffle keys saves by SWF URL path, which differs between firmwares, and canonicalises symlinks, so make the shell save with a path independent `SharedObject.getLocal(name, "/")`.
+Front end arguments, for reference (patch 0006): `--width` and `--height` (default full screen), `-q/--quality` (default `low`, the fastest, no AA), `--player-runtime` (default `air`), `--save-directory` (required), `-Pkey=value` flashvars (repeatable), `--render-size WxH` (draw at this size and scale up), `--gl-finish` (replace GL fence waits by `glFinish`, for drivers with a broken `glClientWaitSync`) and `--stage-scale fit|movie` (default `fit`: centred with letterbox bars; `movie`: the movie's own scale mode and alignment). The quality names come from Ruffle's own `StageQuality` parser (`low`, `medium`, `high`, `best`, `8x8`, `8x8linear`, `16x16`, `16x16linear`), and the template cfg offers `low`, `medium` and `high`. There is no filesystem access option in this front end's command line. See [04](04-ruffle-sdl.md). Saves land in `saves/localhost/<name>.sol`, the same storage as desktop Ruffle. Ruffle keys saves by SWF URL path, which differs between firmwares, and canonicalises symlinks, so make the shell save with a path independent `SharedObject.getLocal(name, "/")`.
 
 ### Why a relative tee
 
@@ -41,8 +41,8 @@ Rules:
 
 * Bump `tools/patch/version` every time any SWF patch changes. Versions that were pushed are immutable.
 * The stamp logic lives in the launcher, where reviewers can read it. Do not source a helper that both patchscript and launcher use.
-* Edit the file list in `stamp()` to match your patchscript (sources, outputs, converted assets).
-* A fresh copy wins over backups: patched SWFs are stored uncompressed (FWS) because xdeltas apply to inflated SWFs, originals are usually CWS. A CWS file means a fresh copy and replaces the kept `.orig`.
+* Edit the file list in `stamp()` (marked `EDIT` in the template, the default list is only an example) to match your patchscript: sources, outputs, converted assets.
+* A fresh copy wins over backups. For an in place patch the template patchscript compares the file with the manifest md5: a file that matches the manifest is a fresh copy of the game and replaces the kept `<file>.orig`, anything else is a leftover patched file and the kept `.orig` is used (see [03](03-delivery.md)).
 
 ### The patcher
 
@@ -53,8 +53,20 @@ The patchscript (`tools/patchscript`) follows a fixed protocol:
 * `fail()` echoes `ERROR: ...`, `PATCH_FAIL_MSG:Setup failed: ...`, `Patching process failed!` and exits 1. The patcher screen shows the message.
 * Progress lines look like `[3/12] Patching shell`. There is no real progress bar, numbered steps read like one.
 * It logs through `exec > >(tee "$GAMEDIR/patchlog.txt") 2>&1`, because output is otherwise only on the screen.
-* It checks md5 of every input (a missing file gives "Copy the game folder into ports/MYPORT/gamedata/", a mismatch names the unsupported release), inflates, applies `xdelta3 -d`, keeps `.orig` for in place patches, and removes only what is useless on ARM (`Adobe AIR`, `META-INF`, `*.exe`, `*.dll`, `mimetype`), nothing broader.
-* The last step writes `.port_patched` and prints "=== Done. Enjoy! ===".
+* It is generic and data driven. Nothing game specific lives in the script, you edit the tables in `tools/patch/`:
+
+| File | Content |
+|-|-|
+| `version` | one integer, the patch version. Bump it on every change of any patch or table |
+| `manifest.txt` | `md5  path` lines (the `md5sum` format) for every original input, paths relative to `gamedata/`. Made with `tools/delivery/make_manifest.sh` |
+| `files.txt` | `orig\|patch\|out` per SWF to patch. The patch is an xdelta in `tools/patch/` made against the inflated original. `out` equal to `orig` patches in place and keeps `orig.orig`, a different `out` writes a new file and leaves `orig` alone |
+| `atf.txt` | optional, `kind\|scale\|input\|outdir`. `atf` decodes one ATF to a PNG, `swf` extracts the ATF textures embedded in a SWF |
+| `atlas.txt` | optional, `factor\|file.xml`. Scales an atlas XML, always from `file.xml.orig` |
+| `cleanup.txt` | optional, one glob per line (relative to `gamedata/`) of files the port never loads, deleted at the end. Absolute paths and `..` are refused. Keep it narrow |
+
+* For every file it checks the md5 against the manifest (a missing file gives "Copy the whole game folder into ports/MYPORT/gamedata/", a mismatch names the unsupported release), inflates CWS and ZWS with `tools/atftool inflate`, applies `xdelta3 -d` to a temporary file and renames it into place.
+* It counts the steps first, so the screen shows `[n/total]`.
+* The last step writes the version into `gamedata/.port_patched` and prints "=== Done. Enjoy! ===". Success is only announced this way.
 
 Ship deltas only, never patched SWFs. The README lists the md5 of each supported input and the patcher refuses other builds.
 
@@ -64,23 +76,29 @@ Ship deltas only, never patched SWFs. The README lists the md5 of each supported
 
 | Variable | Values | Meaning |
 |-|-|-|
-| `QUALITY` | low, medium, high | low is fastest (no anti aliasing), medium 2x, high 4x MSAA |
-| `ASPECT` | extend, fit, fill | passed as `-Paspect=` (see [08](08-screen-aspect.md)) |
-| `FRAME_RATE` | 30, 60 | 60 only for devices that hold it |
-| `RENDER_SIZE` | empty or WxH | optional lower render size |
-| `VERBOSE_LOGS` | 0 or 1 | see below |
+| `QUALITY` | low (default), medium, high | `--quality`. Low is fastest (no anti aliasing). Medium and high use 2x and 4x multisampling in Ruffle |
+| `ASPECT` | fit (default), fill, extend | passed as `-Paspect=` and needs the shell patch (see [08](08-screen-aspect.md)) |
+| `FRAME_RATE` | 30 (default), 60 | passed as `-Pfps=`, needs the shell patch. 60 only for devices that hold it |
+| `RENDER_SIZE` | empty (default) or WxH | `--render-size`, draw smaller and scale up |
+| `RUFFLE_MIN_KEY_HOLD_MS` | 100 (default) | minimum key hold, see [09](09-input.md) |
+| `RUFFLE_GC_STEP`, `RUFFLE_TRIM_SECS`, `RUFFLE_GC_LONG_TICK` | 0.01, 2, 1.0 | memory tuning, see [05](05-memory.md) |
+| commented `RUFFLE_*` switches | off by default | advanced comparison switches (lazy shapes, draw in place and so on), remove the `#` to apply, see [env-vars.md](env-vars.md) |
+| `VERBOSE_LOGS` | 0 or 1 (template default 1) | see below |
 
-The cfg documents each variable in comments. Add a variable only when something reads it. An env switch with no reader (a leftover `FPS_LOG_OFF`) was once left in a launcher and had to be removed.
+The cfg is plain shell (`NAME="value"` or `export NAME=value`) and documents each variable in comments. Per level values belong in `tools/run-ruffle.env`, not here. Add a variable only when something reads it. An env switch with no reader (a leftover `FPS_LOG_OFF`) was once left in a launcher and had to be removed.
 
 ## Relaunch wrapper (run-ruffle)
 
-Ruffle never frees the library of an unloaded movie, so a big game made of several SWFs runs out of memory on 1 GB. The shell calls `fscommand("relaunch", "<args>")`. `ruffle_sdl` prints a stdout line `RUFFLE_RELAUNCH <args>` and exits. `tools/run-ruffle <ruffle_sdl> <args...> <file.swf>` (bash builtins only):
+Ruffle never frees the library of an unloaded movie, so a big game made of several SWFs runs out of memory on 1 GB. The shell calls `fscommand("relaunch", "<args>")`. `ruffle_sdl` prints a stdout line `RUFFLE_RELAUNCH <args>` and exits (patches 0002 and 0006). `tools/run-ruffle <ruffle_sdl> <args...> <file.swf>` is a bash script that uses only shell builtins (no `stat`, `mktemp`, `sed` or `tail`, so it cannot fail on a firmware that lacks one):
 
-* runs the binary, echoes every output line to stderr so it reaches `log.txt`,
-* when it sees the marker line it restarts the binary with the new arguments appended,
-* otherwise exits with the binary's code.
+* it runs the binary and copies every output line to its own stdout, so it reaches `log.txt`,
+* when it sees a line that starts with the marker it restarts the binary with the words after the marker (split like a shell does: spaces separate, quotes group, a backslash escapes),
+* a `-Pname=value` in those words replaces the same `-Pname` from the first command line, the other first command line arguments are kept, and an argument that ends in `.swf` replaces the SWF to run,
+* otherwise it exits with the code of the last `ruffle_sdl` run (127 when the binary is missing or not executable).
 
-The marker prefix can be changed with `RELAUNCH_MARKER` (default `RUFFLE_RELAUNCH`). Per target environment switches (for example the lazy mouse pick for AS2 SWFs, or frame skip for one heavy SWF) go in a small table inside the script. It is non standard, so keep it and justify it: "one big SWF in memory at a time". A black screen of a few seconds on a world change is expected and worth a line in the README.
+Environment: `RELAUNCH_MARKER` (marker word, default `RUFFLE_RELAUNCH`), `RELAUNCH_MAX` (restart limit per run, default 500, then it stops with exit 1) and `RUN_RUFFLE_ENV` (the per level table, default `tools/run-ruffle.env` next to the script).
+
+`tools/run-ruffle.env` is the table of per level environment. One rule per line, `glob|VAR=value VAR=value`, lines starting with `#` ignored. The glob is matched against all arguments joined by spaces with a space at both ends, for example `* -Plevel=big *|RUFFLE_FRAMESKIP=1`. The matching variables are exported for that run only (a lazy mouse pick for AS2 SWFs, or frame skip for one heavy SWF). The wrapper is non standard, so keep it and justify it: "one big SWF in memory at a time". A black screen of a few seconds on a world change is expected and worth a line in the README.
 
 Do not read Ruffle's output through `sed` or `tail` in the wrapper under a compositor wrapper (a dead end: the preload banner was re-read as a target and it looped).
 
@@ -104,12 +122,18 @@ Things reviewers asked to remove: a patcher fallback, `kill -9` of gptokeyb afte
 
 ## Logs that help bug reports (VERBOSE_LOGS)
 
-The template keeps all diagnostics inside two clearly marked blocks (`BEGIN TESTING BLOCK` ... `END TESTING BLOCK`) controlled by `VERBOSE_LOGS`:
+`VERBOSE_LOGS` is a cfg switch read by the launcher. The template default is `1`, for testing builds. Everything it adds is marked so it can be removed.
 
-* `VERBOSE_LOGS=1` (the template default, for testing builds): keeps `log.prev.txt`, logs uname, `CFW_NAME`, `DEVICE_*`, display size, free memory, swap and zram state, the binary's glibc requirement, the cfg and the exact arguments, the relevant `RUFFLE_*` environment, and on exit the exit code with 137 and 143 explained, free memory and kernel OOM lines. The cfg also turns on the frame log, timing, memory log and profilers when verbose (see [env-vars.md](env-vars.md)).
-* `VERBOSE_LOGS=0`: a minimal log.
+With `VERBOSE_LOGS=1`:
 
-Before a PortMaster pull request, set the cfg default to 0 and delete the testing blocks, since reviewers reject long launchers. Ask testers in the testing thread to attach `log.txt` and `patchlog.txt`. Read the whole log, not the head.
+* The launcher keeps the previous log: `mv -f log.txt log.prev.txt` runs before the new log starts (a non standard line, marked as testing only).
+* The first block, marked `BEGIN TESTING BLOCK` and `END TESTING BLOCK`, runs before the game: date, `uname -a`, `CFW_NAME`, `DEVICE_NAME`, `DEVICE_CPU`, `DEVICE_ARCH`, `DEVICE_RAM`, swap and zram flags, display size, the device's glibc version, the highest `GLIBC_` symbol the binary needs (compare it with `min_glibc` in `port.json`), `MemTotal`, `MemAvailable`, `SwapTotal`, `SwapFree`, `/proc/swaps`, zram disk size and algorithm, the cfg values, the patch version, the exact `run-ruffle` command with its arguments, and every `RUST_LOG`, `RUFFLE_*`, `PM_GPUSTAT`, `WGPU_*` and `SDL_*` variable in the environment.
+* A second block with the same markers runs after the game: the exit code (137 and 143 are normal after the quit hotkey), free memory and swap, and the last kernel lines about out of memory kills or Mali errors.
+* The cfg exports the diagnostics for the player (inside `if [ "$VERBOSE_LOGS" = 1 ]`): `RUST_LOG="warn,ruffle_sdl=debug,memlog=info,pmgpu=info,ruffle_core::player::port_fps=info"`, `RUFFLE_FPS_LOG=1`, `RUFFLE_SDL_TIMING=1`, `RUFFLE_MEMLOG=1` with `RUFFLE_MEMLOG_MS=500`, `RUFFLE_MEMLOG_TOP=8` and `RUFFLE_MEMLOG_PEAK="$GAMEDIR/memlog-peak.txt"`, `RUFFLE_AS3_PROF=1` and `PM_GPUSTAT=1`. See [env-vars.md](env-vars.md). Note that the AS3 profile lines are logged at info level under the target `ruffle_core::avm2::function::as3prof`, which this `RUST_LOG` does not list, so add it if you want to see them.
+
+With `VERBOSE_LOGS=0` only what `ruffle_sdl` prints itself (warnings and errors) is logged, plus the setup log.
+
+Before a PortMaster pull request, remove all of it: delete both `BEGIN TESTING BLOCK` to `END TESTING BLOCK` blocks and the `mv -f log.txt log.prev.txt` line from the launcher, set `VERBOSE_LOGS=0` and delete the diagnostics exports from the cfg. Reviewers reject long launchers. Ask testers in the testing thread to attach `log.txt` and `patchlog.txt`. Read the whole log, not the head.
 
 ## Metadata
 
@@ -130,7 +154,7 @@ Set `min_glibc` to the measured maximum `GLIBC_x.y` symbol of the shipped binari
 
 ## Release zip
 
-`package.sh` (in `templates/port/` or the packaging tool) copies the launcher and the port folder, removes saves, config, cache, logs and all gamedata except the placeholder text file, copies the metadata, renames `README.md` to `MYPORT.md`, and runs `zip -9 -r -q -X`. Always list the zip contents before release. An untracked old 33 MB binary nearly got zipped once. Updates do not delete old files on devices, so compare the release zip against an install by md5 and tell users about obsolete files. Leave `port.json` alone on the device (PortMaster adds fields at install).
+The toolkit has no packaging script, so do it with a short script of your own (outside the repository history if it only encodes your paths): copy the launcher and the port folder, remove saves, logs, `patchlog.txt` and every file in `gamedata/` except the placeholder text file, copy the metadata, rename `README.md` to `MYPORT.md`, delete `SUBMISSION.md`, and run `zip -9 -r -q -X`. Always list the zip contents before release. An untracked old 33 MB binary nearly got zipped once. Updates do not delete old files on devices, so compare the release zip against an install by md5 and tell users about obsolete files. Leave `port.json` alone on the device (PortMaster adds fields at install).
 
 ## Submission flow
 

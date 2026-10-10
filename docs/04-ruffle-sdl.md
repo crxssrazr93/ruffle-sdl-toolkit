@@ -9,7 +9,7 @@ Read this when you are about to build, run, debug or ship the `ruffle_sdl` binar
 `ruffle_sdl` is a new workspace crate (`sdl/`) added to Ruffle by patch 0006. It replaces the combination of "desktop Ruffle inside a Weston/X11 compositor wrapper" with one small native binary.
 
 * It links only `libSDL2`, `libasound` and glibc (plus libdl, libgcc_s, libpthread, libm). No X11, no Wayland, no Weston, no OpenSSL, no fontconfig, no OpenH264.
-* The stripped aarch64 binary is about 16.7 MB (the desktop build it replaced was 32 to 34 MB). The glibc floor is 2.30 (see below).
+* The stripped aarch64 binary was about 16.7 MB in the port this series came from (the desktop build it replaced was 32 to 34 MB). That figure was not remeasured with the toolkit's build script. The glibc floor is 2.30 (see below).
 * It uses the SDL2 and GLES 3.0 the firmware already ships. Knulli ships SDL 2.32.8, muOS 2601 ships SDL 2.28.5, and the supported floor is SDL 2.0.10.
 * Source layout: `sdl/src/main.rs` (window, GL, loop, input, CLI), `keys.rs` (SDL scancode and keycode to Ruffle key, with left, right and numpad locations), `audio.rs` (SDL audio with fallbacks).
 * Saves use the same storage code as desktop Ruffle (`saves/localhost/<name>.sol`), so switching front ends keeps progress.
@@ -67,7 +67,7 @@ To find this kind of problem for any SDL binary, list its undefined SDL symbols 
 ruffle_sdl <swf>
     --save-directory DIR          required, where shared objects are written
     [--width W --height H]        windowed; without --width it is fullscreen_desktop
-    [-q | --quality low]          low (default), medium, high, best
+    [-q | --quality low]          low (default), medium, high, best, 8x8, 8x8linear, 16x16, 16x16linear
     [--player-runtime air]        air (default) or flash_player
     [-Pkey=value ...]             flashvars, repeatable
     [--render-size WxH]           draw at this size and scale up (see below)
@@ -78,7 +78,7 @@ ruffle_sdl <swf>
 * `--render-size 640x480` draws the movie at that resolution and blits it scaled, letterboxed in the centre. Mouse coordinates are mapped back through the same transform. It cuts fill rate on weak GPUs and is the first thing to try when the GPU is the bottleneck.
 * `--stage-scale fit` forces letterbox on, ShowAll scaling and the default alignment over whatever the movie asks for. Desktop games that request top left and no scaling would otherwise sit in a corner. `--stage-scale movie` keeps the movie's own scale mode and alignment, for a shell that lays itself out (use this when the SWF does its own resize handling). See `08-screen-aspect.md`.
 * `-q low` (no anti aliasing) is the default and what handhelds want.
-* Equivalents of old desktop Ruffle flags: `--player-runtime air` is the default, `--letterbox off` is `--stage-scale movie`, `--quality <q>` carries over, `--filesystem-access-mode allow` is implicit (local files are always allowed), network is always denied, and flashvars become `-Pkey=value`.
+* Rough equivalents of old desktop Ruffle flags: `--player-runtime air` is the default, `--letterbox off` corresponds to `--stage-scale movie`, `--quality <q>` carries over (the names are Ruffle's own `StageQuality` values), and flashvars become `-Pkey=value`. This front end has no `--filesystem-access-mode` option, no `--letterbox` option and no network options. It loads local files relative to the SWF folder through its null navigator (see "Audio, loading and backends"), and it has no network stack, so there is nothing to switch on or off.
 
 The environment variables the binary reads are listed in `env-vars.md`. The PC only hint `SDL_VIDEO_X11_FORCE_EGL=1` is set by the binary itself, because Mesa on X11 hands out GLES contexts only through EGL.
 
@@ -87,9 +87,9 @@ The environment variables the binary reads are listed in `env-vars.md`. The PC o
 All scripts live in `ruffle/` (see `../ruffle/README.md`).
 
 1. `ruffle/fetch.sh <dir>` clones Ruffle, checks out the commit in `ruffle/PIN` (`dcc85a1b`, "Release 0.7.0-nightly.2026.10.4") and applies the series with `git am`. Set `RUFFLE_REPO` to clone from a mirror. Set `WITH_OPTIONAL="0100"` to also apply optional patches such as the software cursor.
-2. `ruffle/build-aarch64.sh <src> <out>` builds inside Docker and prints the maximum `GLIBC_` symbol and the `NEEDED` libraries.
+2. `ruffle/build-aarch64.sh <src> <out>` builds inside Docker (image tag `ruffle-sdl-cross`, built from `ruffle/Dockerfile`), writes `<out>/ruffle_sdl` and prints the maximum `GLIBC_` symbol and the `NEEDED` libraries. Environment: `CARGO_CACHE` (registry cache, default `<out>/.cargo-cache`), `TARGET_DIR` (cargo target folder, default `<out>/.target`, so the source tree stays clean), `CPU` (default `cortex-a53`, use `generic` for another core) and `IMAGE`. Output files are chowned back to you. The script has not yet been run for `ruffle_sdl` itself in the toolkit's own checks (the Docker image was proven with `tools/atf/build-aarch64.sh`).
 3. `ruffle/build-aarch64-native.sh <src> <out>` is the Docker free variant (clang, lld and a Debian bullseye arm64 sysroot made with debootstrap and holding `libsdl2-dev` and `libasound2-dev`).
-4. `ruffle/build-x86_64.sh <src> <out>` builds a PC binary for the Xvfb harness.
+4. `ruffle/build-x86_64.sh <src> <out>` builds a PC binary for the Xvfb harness (`cargo build --release -p ruffle_sdl --features lzma`, needs the SDL2 and ALSA development packages). It took about 3.5 minutes in a release build here. `CARGO_TARGET_DIR` overrides the target folder.
 
 ### The Docker cross toolchain
 
@@ -105,7 +105,7 @@ with `RUSTFLAGS="-C target-cpu=cortex-a53 -L native=/usr/lib/aarch64-linux-gnu"`
 
 ### The glibc floor
 
-The build environment has glibc 2.31, but the shipped binary needs at most `GLIBC_2.30`, and the PortMaster metadata says `min_glibc "2.30"`. Two sources call this a "2.31 floor". Treat 2.31 as the build image version and 2.30 as the measured symbol floor. The build script should fail when the maximum symbol exceeds 2.30. Check it yourself with:
+The build environment has glibc 2.31, but the shipped binary needs at most `GLIBC_2.30`, and the PortMaster metadata says `min_glibc "2.30"`. Two sources call this a "2.31 floor". Treat 2.31 as the build image version and 2.30 as the measured symbol floor. The build script only prints the maximum, it does not fail when it exceeds 2.30, so read the line it prints. Check it yourself with:
 
 ```
 objdump -T ruffle_sdl | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
@@ -150,7 +150,7 @@ The `ruffle_sdl` front end, the SDL 2.0.10 fix and the memory patches are by Kni
 ## Pitfalls
 
 * Stale binary on PC: build from inside the Ruffle tree with an explicit `CARGO_TARGET_DIR`.
-* Root owned Docker output: `chown -R $(id -u):$(id -g)` the output, and never share a root owned `CARGO_TARGET_DIR` with a host build (cargo fails with permission denied on `.cargo-build-lock`).
+* Root owned Docker output: `build-aarch64.sh` chowns its output back to you when it finishes. If a run was killed half way, `chown -R $(id -u):$(id -g)` the output and target folders, and never share a root owned `CARGO_TARGET_DIR` with a host build (cargo fails with permission denied on `.cargo-build-lock`).
 * Missing `--features lzma` makes ZWS SWFs fail to load.
 * A binary that shows `GLIBC_2.31` or higher will not start on older firmware. Gate the build.
 * The relaunch wrapper does not change the process name. gptokeyb's hotkey runs `pkill -f ruffle_sdl`, which also matches the wrapper (it has `ruffle_sdl` in its arguments) and so ends the relaunch loop. That is desired, but keep the kill name out of your log path.
