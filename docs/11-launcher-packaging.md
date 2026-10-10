@@ -2,7 +2,7 @@
 
 ## When you need this
 
-Read this when you turn a patched Flash or AIR game into a PortMaster port: filling in the launcher template, the cfg and gptk files, the patcher and its markers, the relaunch wrapper, the metadata files, the release zip, and the review and testing thread steps. The templates live in `templates/port/`. This page explains why each line is there so you can defend it in review.
+Read this when you turn a patched Flash or AIR game into a PortMaster port: filling in the launcher template, the cfg and gptk files, the patcher and its markers, the relaunch wrapper, the metadata files, the release zip, and the review and testing thread steps. The templates live in `templates/port/`. Paths such as `tools/patch/` and `tools/run-ruffle` are relative to the port folder (`templates/port/MYPORT/` in the template). This page explains why each line is there so you can defend it in review.
 
 ## The template walk through
 
@@ -98,7 +98,7 @@ Ruffle never frees the library of an unloaded movie, so a big game made of sever
 
 Environment: `RELAUNCH_MARKER` (marker word, default `RUFFLE_RELAUNCH`), `RELAUNCH_MAX` (restart limit per run, default 500, then it stops with exit 1) and `RUN_RUFFLE_ENV` (the per level table, default `tools/run-ruffle.env` next to the script).
 
-`tools/run-ruffle.env` is the table of per level environment. One rule per line, `glob|VAR=value VAR=value`, lines starting with `#` ignored. The glob is matched against all arguments joined by spaces with a space at both ends, for example `* -Plevel=big *|RUFFLE_FRAMESKIP=1`. The matching variables are exported for that run only (a lazy mouse pick for AS2 SWFs, or frame skip for one heavy SWF). The wrapper is non standard, so keep it and justify it: "one big SWF in memory at a time". A black screen of a few seconds on a world change is expected and worth a line in the README.
+`tools/run-ruffle.env` is the optional table of per level environment (the template does not ship one, so create it when you need it). One rule per line, `glob|VAR=value VAR=value`, lines starting with `#` ignored. The glob is matched against all arguments joined by spaces with a space at both ends, for example `* -Plevel=big *|RUFFLE_FRAMESKIP=1`. The matching variables are exported for that run only (a lazy mouse pick for AS2 SWFs, or frame skip for one heavy SWF). The wrapper is non standard, so keep it and justify it: "one big SWF in memory at a time". A black screen of a few seconds on a world change is expected and worth a line in the README.
 
 Do not read Ruffle's output through `sed` or `tail` in the wrapper under a compositor wrapper (a dead end: the preload banner was re-read as a target and it looped).
 

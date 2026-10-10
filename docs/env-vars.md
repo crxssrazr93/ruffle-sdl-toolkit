@@ -63,7 +63,7 @@ Owner means who wrote it: K is Knifethrower, C is crxssrazr93, U is upstream or 
 | `RUFFLE_AS3_PROF` | off, any value turns it on | Hottest AS3 methods every 5 s. Needs `ruffle_core::avm2::function::as3prof=info`. | Find game side hot spots to patch. | 0003, `core/src/avm2/function.rs` | C |
 | `PM_GPUSTAT` | off, any value turns it on | GPU submit, pass and draw counters every 2 s (target `pmgpu`, needs `pmgpu=info`). | GPU submit profiling. | 0011, `render/wgpu/src/pmstat.rs` | K |
 | `RUFFLE_RELAUNCH` (a line, not a variable) | not applicable | Stdout marker line `RUFFLE_RELAUNCH <args>` printed by the relaunch fscommand. | Never set. Wrapper reads it. | 0002 and 0006 | C |
-| `RELAUNCH_MARKER` | `RUFFLE_RELAUNCH` | The wrapper's marker prefix override. | Only if you changed the marker in the patch. | `templates/port/.../run-ruffle` | C |
+| `RELAUNCH_MARKER` | `RUFFLE_RELAUNCH` | The wrapper's marker prefix override. | Only if you changed the marker in the patch. | `templates/port/MYPORT/tools/run-ruffle` | C |
 
 ### Drivers and SDL
 
