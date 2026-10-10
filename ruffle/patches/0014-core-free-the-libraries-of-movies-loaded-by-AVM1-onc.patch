@@ -1,0 +1,1426 @@
+From 99c0fd793e59e68c259dfa25e1430ccdc2a77c5a Mon Sep 17 00:00:00 2001
+From: Knifethrower <132020881+Knifethrower@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 13:43:15 -0400
+Subject: [PATCH] core: free the libraries of movies loaded by AVM1 once
+ nothing uses them
+
+Every loaded SWF gets a MovieLibrary (characters, bitmaps and their GPU
+textures, tessellated shapes, the SWF data). The registry only held its key
+weakly, but the library held its own movie strongly, so no library was ever
+dropped: memory grew with every loadMovie until the process exited
+(ruffle-rs/ruffle#24864). Games that load a SWF per scene ran out of memory
+within minutes on 1 GB handhelds.
+
+A library is now a garbage collected object (MovieLibraryGc). The registry
+holds it weakly, and display objects keep the library of their movie alive
+(DisplayObjectBase::library, set when an object gets a parent and when a movie
+is loaded into a clip). Libraries are pinned (held for the life of the
+player, as before) unless the movie was loaded by AVM1 (loadMovie,
+MovieClipLoader, images included) or is a data-less placeholder movie (unloaded
+clips, loading and error stand-ins). The root movie and all AVM2 content stay
+pinned. RUFFLE_FREE_LOADED_MOVIES=0 keeps every library, as upstream does.
+
+RUFFLE_MEMLOG: compressed library bitmaps and parsed shape records are tagged
+instead of counted as static, so they leave the Library category when freed.
+
+Machinarium (AVM1, a SWF per scene and per hint book page), hint book opened
+and closed 20 times in one scene, the series plus this patch: on a PC (Xvfb,
+llvmpipe) RSS 262 -> 265 MB, with RUFFLE_FREE_LOADED_MOVIES=0 297 -> 347 MB;
+on an RG Cube XX (Knulli, Mali-G31, aarch64 build of the same tree) 276 to
+298 MB over the 20 cycles with no trend. Ruffle regression tests avm1/,
+avm2/, import_assets/, fonts/, mixed_avm/ (1962): all pass with and without
+this patch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/src/avm1/globals/bitmap_data.rs          |   4 +-
+ core/src/avm1/globals/movie_clip.rs           |  20 ++-
+ core/src/avm1/globals/sound.rs                |  18 ++-
+ core/src/avm2.rs                              |   8 +-
+ core/src/avm2/globals/flash/display/bitmap.rs |  14 +-
+ .../avm2/globals/flash/display/bitmap_data.rs |   3 +-
+ .../avm2/globals/flash/display/loader_info.rs |   6 +-
+ .../globals/flash/display/simple_button.rs    |   3 +-
+ core/src/avm2/globals/flash/display/sprite.rs |   3 +-
+ core/src/avm2/globals/flash/media/sound.rs    |   9 +-
+ core/src/avm2/globals/flash/media/video.rs    |   3 +-
+ core/src/avm2/globals/flash/text/font.rs      |  12 +-
+ core/src/avm2/object/bytearray_object.rs      |   9 +-
+ core/src/avm2/object/font_object.rs           |   9 +-
+ core/src/backend/audio.rs                     |   9 +-
+ core/src/character.rs                         |   6 +-
+ core/src/context.rs                           |   3 +-
+ core/src/debug_ui/display_object.rs           |  18 +--
+ core/src/debug_ui/movie.rs                    |  15 +-
+ core/src/display_object.rs                    |  24 ++-
+ core/src/display_object/avm1_button.rs        |   6 +-
+ core/src/display_object/avm2_button.rs        |   3 +-
+ core/src/display_object/graphic.rs            |  49 +++++--
+ core/src/display_object/morph_shape.rs        |  14 +-
+ core/src/display_object/movie_clip.rs         | 115 ++++++++++-----
+ core/src/display_object/text.rs               |  12 +-
+ core/src/external.rs                          |   3 +-
+ core/src/html/layout/context.rs               |  20 ++-
+ core/src/html/text_format.rs                  |   8 +-
+ core/src/library.rs                           | 137 +++++++++++++++---
+ core/src/loader.rs                            |  23 ++-
+ 31 files changed, 423 insertions(+), 163 deletions(-)
+
+diff --git a/core/src/avm1/globals/bitmap_data.rs b/core/src/avm1/globals/bitmap_data.rs
+index 99ebc323b..39c4cec23 100644
+--- a/core/src/avm1/globals/bitmap_data.rs
++++ b/core/src/avm1/globals/bitmap_data.rs
+@@ -1325,8 +1325,8 @@ fn load_bitmap<'gc>(
+     );
+ 
+     let character = library
+-        .library_for_movie(movie)
+-        .and_then(|l| l.character_by_export_name(&name));
++        .library_for_movie(movie, activation.gc())
++        .and_then(|l| l.borrow().character_by_export_name(&name));
+ 
+     let Some((_id, Character::Bitmap(bitmap))) = character else {
+         return Ok(Value::Undefined);
+diff --git a/core/src/avm1/globals/movie_clip.rs b/core/src/avm1/globals/movie_clip.rs
+index a12c75f72..1f28ea123 100644
+--- a/core/src/avm1/globals/movie_clip.rs
++++ b/core/src/avm1/globals/movie_clip.rs
+@@ -790,12 +790,15 @@ fn attach_movie<'gc>(
+         return Ok(Value::Undefined);
+     }
+ 
+-    if let Some(new_clip) = activation
++    let new_clip = activation
+         .context
+         .library
+-        .library_for_movie(movie_clip.movie())
+-        .and_then(|l| l.instantiate_by_export_name(&export_name, activation.gc()))
+-    {
++        .library_for_movie(movie_clip.movie(), activation.gc())
++        .and_then(|l| {
++            l.borrow()
++                .instantiate_by_export_name(&export_name, activation.gc())
++        });
++    if let Some(new_clip) = new_clip {
+         new_clip.set_placed_by_avm1_script(true);
+         // Set name and attach to parent.
+         new_clip.set_name(activation.gc(), new_instance_name);
+@@ -977,10 +980,11 @@ pub fn clone_sprite<'gc>(
+     #[allow(clippy::question_mark)]
+     let cloned_sprite = if sprite.id() != 0 {
+         // Clip from SWF; instantiate a new copy.
+-        let library = context.library.library_for_movie(movie).unwrap();
+-        library
+-            .instantiate_by_id(sprite.id(), context.gc())
+-            .unwrap()
++        let library = context.library.library_for_movie_mut(movie, context.gc());
++        let clip = library
++            .borrow()
++            .instantiate_by_id(sprite.id(), context.gc());
++        clip.unwrap()
+     } else if sprite.as_movie_clip().is_some() {
+         // Dynamically created MovieClip; create a new empty movie clip.
+         MovieClip::new(movie, context.gc()).as_displayobject()
+diff --git a/core/src/avm1/globals/sound.rs b/core/src/avm1/globals/sound.rs
+index baab6a13e..36bf1ae64 100644
+--- a/core/src/avm1/globals/sound.rs
++++ b/core/src/avm1/globals/sound.rs
+@@ -458,12 +458,13 @@ fn attach_sound<'gc>(
+             return Ok(Value::Undefined);
+         };
+ 
+-        if let Some((_, Character::Sound(sound_handle))) = activation
++        let character = activation
+             .context
+             .library
+-            .library_for_movie_mut(movie)
+-            .character_by_export_name(&name)
+-        {
++            .library_for_movie_mut(movie, activation.gc())
++            .borrow()
++            .character_by_export_name(&name);
++        if let Some((_, Character::Sound(sound_handle))) = character {
+             sound.set_sound(activation, this, Some(sound_handle));
+             sound.set_duration(
+                 activation
+@@ -880,12 +881,13 @@ fn stop<'gc>(
+                 return Ok(Value::Undefined);
+             };
+ 
+-            if let Some((_, Character::Sound(sound))) = activation
++            let character = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
+-                .character_by_export_name(&name)
+-            {
++                .library_for_movie_mut(movie, activation.gc())
++                .borrow()
++                .character_by_export_name(&name);
++            if let Some((_, Character::Sound(sound))) = character {
+                 // FIXME: This isn't entirely correct. We should only
+                 // stop sounds with this name on this particular sound object;
+                 // right now we're stopping *all* sound objects playing this sound.
+diff --git a/core/src/avm2.rs b/core/src/avm2.rs
+index 8937f7820..ea86349ab 100644
+--- a/core/src/avm2.rs
++++ b/core/src/avm2.rs
+@@ -470,8 +470,12 @@ impl<'gc> Avm2<'gc> {
+ 
+         let class = class_object.inner_class_definition();
+ 
+-        let library = activation.context.library.library_for_movie_mut(movie);
+-        let character = library.character_by_id(id);
++        let character = activation
++            .context
++            .library
++            .library_for_movie_mut(movie, activation.gc())
++            .borrow()
++            .character_by_id(id);
+ 
+         if let Some(character) = character {
+             if matches!(
+diff --git a/core/src/avm2/globals/flash/display/bitmap.rs b/core/src/avm2/globals/flash/display/bitmap.rs
+index db56769f9..bafdc8b38 100644
+--- a/core/src/avm2/globals/flash/display/bitmap.rs
++++ b/core/src/avm2/globals/flash/display/bitmap.rs
+@@ -45,11 +45,15 @@ pub fn bitmap_allocator<'gc>(
+             .library
+             .avm2_class_registry()
+             .class_symbol(class)
+-            && let Some(Character::Bitmap(bitmap)) = activation
+-                .context
+-                .library
+-                .library_for_movie_mut(movie)
+-                .character_by_id(symbol)
++            // the library borrow ends with the block (2024 edition tail expression scope)
++            && let Some(Character::Bitmap(bitmap)) = {
++                activation
++                    .context
++                    .library
++                    .library_for_movie_mut(movie, activation.gc())
++                    .borrow()
++                    .character_by_id(symbol)
++            }
+         {
+             let new_bitmap_data = fill_bitmap_data_from_symbol(activation, bitmap.compressed());
+             let bitmap_data_obj =
+diff --git a/core/src/avm2/globals/flash/display/bitmap_data.rs b/core/src/avm2/globals/flash/display/bitmap_data.rs
+index 6815b7368..b910ee9c0 100644
+--- a/core/src/avm2/globals/flash/display/bitmap_data.rs
++++ b/core/src/avm2/globals/flash/display/bitmap_data.rs
+@@ -108,7 +108,8 @@ pub fn init<'gc>(
+             activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
++                .borrow()
+                 .character_by_id(chara_id)
+         });
+ 
+diff --git a/core/src/avm2/globals/flash/display/loader_info.rs b/core/src/avm2/globals/flash/display/loader_info.rs
+index e2cfe63bf..252259532 100644
+--- a/core/src/avm2/globals/flash/display/loader_info.rs
++++ b/core/src/avm2/globals/flash/display/loader_info.rs
+@@ -52,7 +52,8 @@ pub fn get_application_domain<'gc>(
+                 let domain = activation
+                     .context
+                     .library
+-                    .library_for_movie_mut(movie.clone())
++                    .library_for_movie_mut(movie.clone(), activation.gc())
++                    .borrow()
+                     .try_avm2_domain();
+ 
+                 if let Some(domain) = domain {
+@@ -67,7 +68,8 @@ pub fn get_application_domain<'gc>(
+                 let domain = activation
+                     .context
+                     .library
+-                    .library_for_movie_mut(movie.clone())
++                    .library_for_movie_mut(movie.clone(), activation.gc())
++                    .borrow()
+                     .avm2_domain();
+                 return Ok(DomainObject::from_domain(activation, domain).into());
+             }
+diff --git a/core/src/avm2/globals/flash/display/simple_button.rs b/core/src/avm2/globals/flash/display/simple_button.rs
+index 28614094a..d5f577354 100644
+--- a/core/src/avm2/globals/flash/display/simple_button.rs
++++ b/core/src/avm2/globals/flash/display/simple_button.rs
+@@ -48,7 +48,8 @@ pub fn simple_button_allocator<'gc>(
+             let child = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
++                .borrow()
+                 .instantiate_by_id(symbol, activation.context.gc_context);
+ 
+             if let Some(child) = child {
+diff --git a/core/src/avm2/globals/flash/display/sprite.rs b/core/src/avm2/globals/flash/display/sprite.rs
+index 90a16f2a2..17435ac31 100644
+--- a/core/src/avm2/globals/flash/display/sprite.rs
++++ b/core/src/avm2/globals/flash/display/sprite.rs
+@@ -39,7 +39,8 @@ pub fn sprite_allocator<'gc>(
+             let child = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
++                .borrow()
+                 .instantiate_by_id(symbol, activation.context.gc_context);
+ 
+             if let Some(child) = child {
+diff --git a/core/src/avm2/globals/flash/media/sound.rs b/core/src/avm2/globals/flash/media/sound.rs
+index 45a395373..c19b22af1 100644
+--- a/core/src/avm2/globals/flash/media/sound.rs
++++ b/core/src/avm2/globals/flash/media/sound.rs
+@@ -34,12 +34,13 @@ pub fn init<'gc>(
+             .avm2_class_registry()
+             .class_symbol(class_def)
+         {
+-            if let Some(Character::Sound(sound)) = activation
++            let character = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
+-                .character_by_id(symbol)
+-            {
++                .library_for_movie_mut(movie, activation.gc())
++                .borrow()
++                .character_by_id(symbol);
++            if let Some(Character::Sound(sound)) = character {
+                 sound_object.set_sound(activation.context, sound);
+             } else {
+                 tracing::warn!(
+diff --git a/core/src/avm2/globals/flash/media/video.rs b/core/src/avm2/globals/flash/media/video.rs
+index e987adbfb..d65cfc867 100644
+--- a/core/src/avm2/globals/flash/media/video.rs
++++ b/core/src/avm2/globals/flash/media/video.rs
+@@ -30,7 +30,8 @@ pub fn video_allocator<'gc>(
+             let child = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie)
++                .library_for_movie_mut(movie, activation.gc())
++                .borrow()
+                 .instantiate_by_id(symbol, activation.context.gc_context);
+ 
+             if let Some(child) = child {
+diff --git a/core/src/avm2/globals/flash/text/font.rs b/core/src/avm2/globals/flash/text/font.rs
+index d1c5284d6..876460e1d 100644
+--- a/core/src/avm2/globals/flash/text/font.rs
++++ b/core/src/avm2/globals/flash/text/font.rs
+@@ -113,9 +113,10 @@ pub fn enumerate_fonts<'gc>(
+     if let Some(library) = activation
+         .context
+         .library
+-        .library_for_movie(activation.caller_movie_or_root())
++        .library_for_movie(activation.caller_movie_or_root(), activation.gc())
+     {
+-        for font in library.embedded_fonts() {
++        let embedded = library.borrow().embedded_fonts();
++        for font in embedded {
+             // TODO: EmbeddedCFF isn't supposed to show until it's been used (some kind of internal initialization method?)
+             // Device is only supposed to show when arg0 is true - but that's supposed to be "all known" device fonts, not just loaded ones
+             if font.has_layout() && font.font_type() == FontType::Embedded {
+@@ -156,8 +157,11 @@ pub fn register_font<'gc>(
+             .library
+             .avm2_class_registry()
+             .class_symbol(class.inner_class_definition())
+-        && let Some(lib) = activation.context.library.library_for_movie(movie)
+-        && let Some(Character::Font(font)) = lib.character_by_id(id)
++        && let Some(lib) = activation
++            .context
++            .library
++            .library_for_movie(movie, activation.gc())
++        && let Some(Character::Font(font)) = lib.borrow().character_by_id(id)
+     {
+         activation.context.library.register_global_font(font);
+         return Ok(Value::Undefined);
+diff --git a/core/src/avm2/object/bytearray_object.rs b/core/src/avm2/object/bytearray_object.rs
+index a1e6c24b0..ad5e28f29 100644
+--- a/core/src/avm2/object/bytearray_object.rs
++++ b/core/src/avm2/object/bytearray_object.rs
+@@ -24,8 +24,13 @@ pub fn byte_array_allocator<'gc>(
+         .avm2_class_registry()
+         .class_symbol(class.inner_class_definition())
+     {
+-        if let Some(lib) = activation.context.library.library_for_movie(movie) {
+-            if let Some(Character::BinaryData(binary_data)) = lib.character_by_id(id) {
++        if let Some(lib) = activation
++            .context
++            .library
++            .library_for_movie(movie, activation.gc())
++        {
++            let character = lib.borrow().character_by_id(id);
++            if let Some(Character::BinaryData(binary_data)) = character {
+                 Some(ByteArrayStorage::from_vec(
+                     activation.context,
+                     binary_data.to_vec(),
+diff --git a/core/src/avm2/object/font_object.rs b/core/src/avm2/object/font_object.rs
+index 5b282d126..8b46b2867 100644
+--- a/core/src/avm2/object/font_object.rs
++++ b/core/src/avm2/object/font_object.rs
+@@ -20,8 +20,13 @@ pub fn font_allocator<'gc>(
+         .avm2_class_registry()
+         .class_symbol(class.inner_class_definition())
+     {
+-        if let Some(lib) = activation.context.library.library_for_movie(movie) {
+-            if let Some(Character::Font(font)) = lib.character_by_id(id) {
++        if let Some(lib) = activation
++            .context
++            .library
++            .library_for_movie(movie, activation.gc())
++        {
++            let character = lib.borrow().character_by_id(id);
++            if let Some(Character::Font(font)) = character {
+                 Some(font)
+             } else {
+                 None
+diff --git a/core/src/backend/audio.rs b/core/src/backend/audio.rs
+index 0f63f6b11..bed2bd4a9 100644
+--- a/core/src/backend/audio.rs
++++ b/core/src/backend/audio.rs
+@@ -800,11 +800,12 @@ impl<'gc> AudioManager<'gc> {
+         character_id: CharacterId,
+         sound_info: &SoundInfo,
+     ) {
+-        if let Some(handle) = context
++        let handle = context
+             .library
+-            .library_for_movie_mut(display_object.movie())
+-            .get_sound(character_id)
+-        {
++            .library_for_movie_mut(display_object.movie(), context.gc())
++            .borrow()
++            .get_sound(character_id);
++        if let Some(handle) = handle {
+             use swf::SoundEvent;
+             // The sound event type is controlled by the "Sync" setting in the Flash IDE.
+             match sound_info.event {
+diff --git a/core/src/character.rs b/core/src/character.rs
+index 9901c15b3..2c771e8e5 100644
+--- a/core/src/character.rs
++++ b/core/src/character.rs
+@@ -39,6 +39,9 @@ pub struct BitmapCharacter<'gc> {
+     /// A lazily constructed GPU handle, used when performing fills with this bitmap
+     #[collect(require_static)]
+     handle: OnceCell<BitmapHandle>,
++    /// PortMaster port: `RUFFLE_MEMLOG` accounting of `compressed`, until the library is freed
++    #[collect(require_static)]
++    _memlog: ruffle_render::memlog::Tag,
+     /// The bitmap class set by `SymbolClass` - this is used when we instantaite
+     /// a `Bitmap` displayobject.
+     avm2_class: Lock<BitmapClass<'gc>>,
+@@ -46,7 +49,7 @@ pub struct BitmapCharacter<'gc> {
+ 
+ impl<'gc> BitmapCharacter<'gc> {
+     pub fn new(compressed: CompressedBitmap) -> Self {
+-        ruffle_render::memlog::add_static(
++        let memlog = ruffle_render::memlog::Tag::new(
+             ruffle_render::memlog::Cat::Library,
+             match &compressed {
+                 CompressedBitmap::Jpeg { data, alpha, .. } => {
+@@ -62,6 +65,7 @@ impl<'gc> BitmapCharacter<'gc> {
+         Self {
+             compressed,
+             handle: OnceCell::default(),
++            _memlog: memlog,
+             avm2_class: Lock::new(BitmapClass::NoSubclass),
+         }
+     }
+diff --git a/core/src/context.rs b/core/src/context.rs
+index 7c36d00a9..de51d5c39 100644
+--- a/core/src/context.rs
++++ b/core/src/context.rs
+@@ -389,7 +389,8 @@ impl<'gc> UpdateContext<'gc> {
+         activation
+             .context
+             .library
+-            .library_for_movie_mut(activation.context.root_swf.clone())
++            .library_for_movie_mut(activation.context.root_swf.clone(), activation.gc())
++            .borrow_mut(activation.gc())
+             .set_avm2_domain(stage_domain);
+         activation.context.ui.set_mouse_visible(true);
+ 
+diff --git a/core/src/debug_ui/display_object.rs b/core/src/debug_ui/display_object.rs
+index 25dc722b0..696755ff9 100644
+--- a/core/src/debug_ui/display_object.rs
++++ b/core/src/debug_ui/display_object.rs
+@@ -1662,15 +1662,15 @@ impl DisplayObjectWindow {
+ 
+                 ui.label("Character");
+                 let id = object.id();
+-                if let Some(name) =
+-                    context
+-                        .library
+-                        .library_for_movie(object.movie())
+-                        .and_then(|l| {
+-                            l.export_characters()
+-                                .iter()
+-                                .find_map(|(k, v)| if *v == id { Some(k) } else { None })
+-                        })
++                if let Some(name) = context
++                    .library
++                    .library_for_movie(object.movie(), context.gc())
++                    .and_then(|l| {
++                        l.borrow()
++                            .export_characters()
++                            .iter()
++                            .find_map(|(k, v)| if *v == id { Some(k) } else { None })
++                    })
+                 {
+                     ui.label(format!("{id} {name}"));
+                 } else {
+diff --git a/core/src/debug_ui/movie.rs b/core/src/debug_ui/movie.rs
+index 1d42a4a82..6addeb522 100644
+--- a/core/src/debug_ui/movie.rs
++++ b/core/src/debug_ui/movie.rs
+@@ -88,7 +88,7 @@ impl MovieListWindow {
+                         });
+                     })
+                     .body(|mut body| {
+-                        let movies = context.library.known_movies();
++                        let movies = context.library.known_movies(context.gc());
+ 
+                         for movie in movies {
+                             let url_lower = movie.url().to_ascii_lowercase();
+@@ -157,8 +157,10 @@ impl MovieWindow {
+                 ui.horizontal(|ui| {
+                     ui.selectable_value(&mut self.open_panel, Panel::Information, "Information");
+ 
+-                    if let Some(library) = context.library.library_for_movie(movie.clone())
+-                        && !library.characters().is_empty()
++                    if let Some(library) = context
++                        .library
++                        .library_for_movie(movie.clone(), context.gc())
++                        && !library.borrow().characters().is_empty()
+                     {
+                         ui.selectable_value(&mut self.open_panel, Panel::Characters, "Characters");
+                     }
+@@ -177,8 +179,11 @@ impl MovieWindow {
+         // Cloned up here so we can still use context afterwards
+         let (characters, export_characters) = context
+             .library
+-            .library_for_movie(movie.clone())
+-            .map(|l| (l.characters().clone(), l.export_characters().clone()))
++            .library_for_movie(movie.clone(), context.gc())
++            .map(|l| {
++                let l = l.borrow();
++                (l.characters().clone(), l.export_characters().clone())
++            })
+             .unwrap_or_default();
+ 
+         TextEdit::singleline(&mut self.character_search)
+diff --git a/core/src/display_object.rs b/core/src/display_object.rs
+index 64e3a3258..2ef43e3e5 100644
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -8,6 +8,7 @@ use crate::avm2::{
+ };
+ use crate::context::{RenderContext, UpdateContext};
+ use crate::drawing::Drawing;
++use crate::library::MovieLibraryGc;
+ use crate::prelude::*;
+ use crate::string::{AvmString, WString};
+ use crate::tag_utils::SwfMovie;
+@@ -319,6 +320,11 @@ pub struct DisplayObjectBase<'gc> {
+ 
+     /// Rectangle used for 9-slice scaling (`DisplayObject.scale9grid`).
+     scaling_grid: Cell<Rectangle<Twips>>,
++
++    /// PortMaster port: the library of this object's movie, held so that it stays alive while
++    /// the object does (the library registry only holds collectable libraries weakly). Set when
++    /// the object gets a parent and when a movie is loaded into it.
++    library: Lock<Option<MovieLibraryGc<'gc>>>,
+ }
+ 
+ #[derive(Clone)]
+@@ -364,6 +370,7 @@ impl Default for DisplayObjectBase<'_> {
+             scroll_rect: Cell::new(None),
+             next_scroll_rect: Default::default(),
+             scaling_grid: Default::default(),
++            library: Default::default(),
+         }
+     }
+ }
+@@ -683,6 +690,14 @@ impl<'gc> DisplayObjectBase<'gc> {
+         unlock!(this, Self, parent).set(parent)
+     }
+ 
++    pub fn library(&self) -> Option<MovieLibraryGc<'gc>> {
++        self.library.get()
++    }
++
++    pub fn set_library(this: &Write<Self>, library: Option<MovieLibraryGc<'gc>>) {
++        unlock!(this, Self, library).set(library)
++    }
++
+     fn avm1_removed(&self) -> bool {
+         self.contains_flag(DisplayObjectFlags::AVM1_REMOVED)
+     }
+@@ -1930,6 +1945,12 @@ pub trait TDisplayObject<'gc>:
+         let had_parent = self.parent().is_some();
+         let write = Gc::write(context.gc(), self.base());
+         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
++        if parent.is_some() && write.library().is_none() {
++            let library = context
++                .library
++                .library_for_movie_mut(self.movie(), context.gc());
++            DisplayObjectBase::set_library(write, Some(library));
++        }
+         let parent_removed = had_parent && parent.is_none();
+ 
+         if parent_removed {
+@@ -2429,8 +2450,9 @@ pub trait TDisplayObject<'gc>:
+             {
+                 let domain = context
+                     .library
+-                    .library_for_movie(self.movie())
++                    .library_for_movie(self.movie(), context.gc())
+                     .unwrap()
++                    .borrow()
+                     .avm2_domain();
+ 
+                 let mut activation = Avm2Activation::from_domain(context, domain);
+diff --git a/core/src/display_object/avm1_button.rs b/core/src/display_object/avm1_button.rs
+index b904dc062..4f3ad43b6 100644
+--- a/core/src/display_object/avm1_button.rs
++++ b/core/src/display_object/avm1_button.rs
+@@ -169,7 +169,8 @@ impl<'gc> Avm1Button<'gc> {
+                     _ => {
+                         if let Some(child) = context
+                             .library
+-                            .library_for_movie_mut(movie.clone())
++                            .library_for_movie_mut(movie.clone(), context.gc())
++                            .borrow()
+                             .instantiate_by_id(record.id, context.gc_context)
+                         {
+                             // New child that did not previously exist, create it.
+@@ -302,7 +303,8 @@ impl<'gc> TDisplayObject<'gc> for Avm1Button<'gc> {
+                 if record.states.contains(swf::ButtonState::HIT_TEST) {
+                     match context
+                         .library
+-                        .library_for_movie_mut(self.0.movie())
++                        .library_for_movie_mut(self.0.movie(), context.gc())
++                        .borrow()
+                         .instantiate_by_id(record.id, context.gc_context)
+                     {
+                         Some(child) => {
+diff --git a/core/src/display_object/avm2_button.rs b/core/src/display_object/avm2_button.rs
+index 078366a55..37a549aea 100644
+--- a/core/src/display_object/avm2_button.rs
++++ b/core/src/display_object/avm2_button.rs
+@@ -208,7 +208,8 @@ impl<'gc> Avm2Button<'gc> {
+             if record.states.contains(swf_state) {
+                 match context
+                     .library
+-                    .library_for_movie_mut(movie.clone())
++                    .library_for_movie_mut(movie.clone(), context.gc())
++                    .borrow()
+                     .instantiate_by_id(record.id, context.gc_context)
+                 {
+                     Some(child) => {
+diff --git a/core/src/display_object/graphic.rs b/core/src/display_object/graphic.rs
+index 2287cdfd4..caf44ba92 100644
+--- a/core/src/display_object/graphic.rs
++++ b/core/src/display_object/graphic.rs
+@@ -64,18 +64,23 @@ impl<'gc> Graphic<'gc> {
+         // bytes when the shape is first rendered or hit-tested. They held about 95 MB for World 2
+         // of the game, most of it shapes of levels that are not being played.
+         let lazy_records = lazy_shapes() && lazy_shape_records() && tag.is_some();
+-        if !lazy_records {
+-            account_records(&swf_shape, "preload");
+-        }
++        let records_tag = if lazy_records {
++            OnceCell::new()
++        } else {
++            OnceCell::from(account_records(&swf_shape, "preload"))
++        };
+         let render_handle = if lazy_shapes() {
+             None
+         } else {
+-            let library = context.library.library_for_movie(movie.clone()).unwrap();
+-            Some(
+-                context
+-                    .renderer
+-                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
+-            )
++            let library = context
++                .library
++                .library_for_movie(movie.clone(), context.gc())
++                .unwrap();
++            let library = library.borrow();
++            Some(context.renderer.register_shape(
++                (&swf_shape).into(),
++                &MovieLibrarySource { library: &library },
++            ))
+         };
+         let shared = GraphicShared {
+             id: swf_shape.id,
+@@ -89,6 +94,7 @@ impl<'gc> Graphic<'gc> {
+                 OnceCell::from(swf_shape)
+             },
+             tag: if lazy_records { tag } else { None },
++            records_tag,
+             movie,
+             scaled_handle: RefCell::new(TessellationCache::new()),
+         };
+@@ -128,6 +134,7 @@ impl<'gc> Graphic<'gc> {
+             }),
+             movie: context.root_swf.clone(),
+             scaled_handle: RefCell::new(TessellationCache::new()),
++            records_tag: OnceCell::new(),
+         };
+ 
+         Graphic(Gc::new(
+@@ -197,11 +204,15 @@ impl<'gc> Graphic<'gc> {
+         }
+ 
+         // Retessellate at the new scale
+-        let library = context.library.library_for_movie(shared.movie.clone());
++        let library = context
++            .library
++            .library_for_movie(shared.movie.clone(), context.gc());
+         if let Some(library) = library {
+             let new_handle = context.renderer.register_shape_with_scale(
+                 shared.shape().into(),
+-                &MovieLibrarySource { library },
++                &MovieLibrarySource {
++                    library: &library.borrow(),
++                },
+                 current_scale,
+             );
+ 
+@@ -279,7 +290,8 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
+         // This does not create a new instance, but instead swaps out the underlying static data to point to the new art.
+         if let Some(new_graphic) = context
+             .library
+-            .library_for_movie_mut(self.movie())
++            .library_for_movie_mut(self.movie(), context.gc())
++            .borrow()
+             .get_graphic(id)
+         {
+             self.set_shared(context.gc(), new_graphic.0.shared.get());
+@@ -402,6 +414,9 @@ struct GraphicShared {
+     movie: Arc<SwfMovie>,
+     #[collect(require_static)]
+     scaled_handle: RefCell<TessellationCache>,
++    /// PortMaster port: `RUFFLE_MEMLOG` accounting of the parsed records in `shape`
++    #[collect(require_static)]
++    records_tag: OnceCell<ruffle_render::memlog::Tag>,
+ }
+ 
+ /// PortMaster port: `RUFFLE_LAZY_SHAPES` (default on; "0" turns it off): DefineShape characters are
+@@ -428,7 +443,9 @@ impl GraphicShared {
+             let mut reader = swf::read::Reader::new(tag.slice.data(), tag.swf_version);
+             match reader.read_define_shape(tag.version) {
+                 Ok(shape) => {
+-                    account_records(&shape, "parsed on demand");
++                    let _ = self
++                        .records_tag
++                        .set(account_records(&shape, "parsed on demand"));
+                     shape
+                 }
+                 Err(e) => {
+@@ -452,8 +469,8 @@ impl GraphicShared {
+ }
+ 
+ /// PortMaster port: approximate size of parsed shape records (`RUFFLE_MEMLOG`).
+-fn account_records(shape: &swf::Shape, how: &'static str) {
+-    ruffle_render::memlog::add_static(
++fn account_records(shape: &swf::Shape, how: &'static str) -> ruffle_render::memlog::Tag {
++    ruffle_render::memlog::Tag::new(
+         ruffle_render::memlog::Cat::Library,
+         (shape.shape.capacity() * std::mem::size_of::<swf::ShapeRecord>()
+             + shape
+@@ -463,7 +480,7 @@ fn account_records(shape: &swf::Shape, how: &'static str) {
+                 .count()
+                 * std::mem::size_of::<swf::StyleChangeData>()) as u64,
+         || format!("shape {} records ({}, {how})", shape.id, shape.shape.len()),
+-    );
++    )
+ }
+ 
+ /// PortMaster port: `RUFFLE_LAZY_SHAPE_RECORDS` (default on; "0" turns it off), see
+diff --git a/core/src/display_object/morph_shape.rs b/core/src/display_object/morph_shape.rs
+index 7d81315aa..e1244c7ec 100644
+--- a/core/src/display_object/morph_shape.rs
++++ b/core/src/display_object/morph_shape.rs
+@@ -73,7 +73,8 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
+     fn replace_with(self, context: &mut UpdateContext<'gc>, id: CharacterId) {
+         if let Some(new_morph_shape) = context
+             .library
+-            .library_for_movie_mut(self.movie())
++            .library_for_movie_mut(self.movie(), context.gc())
++            .borrow()
+             .get_morph_shape(id)
+         {
+             unlock!(Gc::write(context.gc(), self.0), MorphShapeData, shared)
+@@ -233,11 +234,14 @@ impl MorphShapeShared {
+         } else {
+             let library = context
+                 .library
+-                .library_for_movie(self.movie.clone())
++                .library_for_movie(self.movie.clone(), context.gc())
+                 .unwrap();
+-            let handle = context
+-                .renderer
+-                .register_shape((&frame.shape).into(), &MovieLibrarySource { library });
++            let handle = context.renderer.register_shape(
++                (&frame.shape).into(),
++                &MovieLibrarySource {
++                    library: &library.borrow(),
++                },
++            );
+             frame.shape_handle = Some(handle.clone());
+             handle
+         }
+diff --git a/core/src/display_object/movie_clip.rs b/core/src/display_object/movie_clip.rs
+index 42e0a8277..01a7d356e 100644
+--- a/core/src/display_object/movie_clip.rs
++++ b/core/src/display_object/movie_clip.rs
+@@ -374,9 +374,19 @@ impl<'gc> MovieClip<'gc> {
+         is_root: bool,
+         loader_info: Option<LoaderInfoObject<'gc>>,
+     ) {
+-        let write = Gc::write(context.gc(), self.0);
+         let movie =
+-            movie.unwrap_or_else(|| Arc::new(SwfMovie::empty(write.movie().version(), None)));
++            movie.unwrap_or_else(|| Arc::new(SwfMovie::empty(self.movie().version(), None)));
++        // PortMaster port: the clip now keeps the new movie's library alive (and no longer the old
++        // one). Placeholder movies without data (unloaded clips, loading and error stand-ins) are new
++        // for every load, so their libraries must not be pinned.
++        if movie.data().is_empty() {
++            context.library.unpin_movie_library(&movie);
++        }
++        let library = context
++            .library
++            .library_for_movie_mut(movie.clone(), context.gc());
++        DisplayObjectBase::set_library(Gc::write(context.gc(), self.base()), Some(library));
++        let write = Gc::write(context.gc(), self.0);
+         assert!(
+             write.shared.get().loader_info.is_none(),
+             "Called replace_movie on a clip with LoaderInfo set"
+@@ -500,7 +510,8 @@ impl<'gc> MovieClip<'gc> {
+         if let Some(symbol) = progress.cur_preload_symbol.take() {
+             match context
+                 .library
+-                .library_for_movie_mut(self.movie())
++                .library_for_movie_mut(self.movie(), context.gc())
++                .borrow()
+                 .character_by_id(symbol)
+             {
+                 Some(Character::MovieClip(mc)) => {
+@@ -678,7 +689,11 @@ impl<'gc> MovieClip<'gc> {
+         let data = reader.read_slice_to_end();
+         if !data.is_empty() {
+             let movie = self.movie();
+-            let domain = context.library.library_for_movie_mut(movie).avm2_domain();
++            let domain = context
++                .library
++                .library_for_movie_mut(movie, context.gc())
++                .borrow()
++                .avm2_domain();
+ 
+             // DoAbc tag seems to be equivalent to a DoAbc2 with no flags (eager)
+             match Avm2::do_abc(
+@@ -720,7 +735,11 @@ impl<'gc> MovieClip<'gc> {
+         let do_abc = reader.read_do_abc_2()?;
+         if !do_abc.data.is_empty() {
+             let movie = self.movie();
+-            let domain = context.library.library_for_movie_mut(movie).avm2_domain();
++            let domain = context
++                .library
++                .library_for_movie_mut(movie, context.gc())
++                .borrow()
++                .avm2_domain();
+             let name = AvmString::new(context.gc(), do_abc.name.decode(reader.encoding()));
+ 
+             match Avm2::do_abc(
+@@ -771,7 +790,8 @@ impl<'gc> MovieClip<'gc> {
+         }
+ 
+         let mc = context.gc();
+-        let library = context.library.library_for_movie_mut(self.movie());
++        let library = context.library.library_for_movie_mut(self.movie(), mc);
++        let mut library = library.borrow_mut(mc);
+ 
+         for asset in exported_assets {
+             let name = asset.name.decode(reader.encoding());
+@@ -1510,8 +1530,12 @@ impl<'gc> MovieClip<'gc> {
+         }
+ 
+         let movie = self.movie();
+-        let library = context.library.library_for_movie_mut(movie.clone());
+-        match library.instantiate_by_id(id, context.gc_context) {
++        let child = context
++            .library
++            .library_for_movie_mut(movie.clone(), context.gc())
++            .borrow()
++            .instantiate_by_id(id, context.gc_context);
++        match child {
+             Some(child) => {
+                 // Remove previous child from children list,
+                 // and add new child onto front of the list.
+@@ -2470,8 +2494,9 @@ impl<'gc> MovieClip<'gc> {
+                     let movie = self.movie();
+                     let domain = context
+                         .library
+-                        .library_for_movie(movie)
++                        .library_for_movie(movie, context.gc())
+                         .unwrap()
++                        .borrow()
+                         .avm2_domain();
+ 
+                     let mut activation = Avm2Activation::from_domain(context, domain);
+@@ -3617,11 +3642,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+         reader: &mut SwfStream<'a>,
+     ) -> Result<(), Error> {
+         let mc = context.gc();
+-        let library = self.library_mut(context);
+         let (id, jpeg_data) = reader.read_define_bits()?;
+-        let jpeg_tables = library.jpeg_tables();
+-        let jpeg_data =
+-            ruffle_render::utils::glue_tables_to_jpeg(jpeg_data, jpeg_tables).into_owned();
++        let jpeg_data = {
++            let library = self.library_mut(context);
++            ruffle_render::utils::glue_tables_to_jpeg(jpeg_data, library.jpeg_tables()).into_owned()
++        };
+         let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(&jpeg_data)?;
+         let bitmap = Character::Bitmap(Gc::new(
+             mc,
+@@ -3632,7 +3657,7 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+                 height,
+             }),
+         ));
+-        library.register_character(id, bitmap);
++        self.library_mut(context).register_character(id, bitmap);
+         Ok(())
+     }
+ 
+@@ -4021,10 +4046,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+     fn import_exports_of_importer(&self, context: &mut UpdateContext<'gc>) {
+         let Some(importer_library) = self
+             .importer_movie
+-            .and_then(|mc| context.library.library_for_movie(mc.movie()))
++            .and_then(|mc| context.library.library_for_movie(mc.movie(), context.gc()))
+         else {
+             return;
+         };
++        let importer_library = importer_library.borrow();
+ 
+         let exported_from_importer = importer_library
+             .export_characters()
+@@ -4034,8 +4060,9 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+                 (name, (*id, character))
+             })
+             .collect::<HashMap<AvmString<'gc>, (CharacterId, Character<'gc>)>>();
++        drop(importer_library);
+ 
+-        let self_library = self.library_mut(context);
++        let mut self_library = self.library_mut(context);
+         for (name, (id, character)) in exported_from_importer {
+             if self_library.character_by_id(id).is_none() {
+                 self_library.register_character(id, character);
+@@ -4061,11 +4088,12 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+         movie: Arc<SwfMovie>,
+     ) {
+         let mc = context.gc();
+-        let library = context.library.library_for_movie_mut(movie);
+-        library.register_export(id, name);
++        let library = context.library.library_for_movie_mut(movie, mc);
++        library.borrow_mut(mc).register_export(id, name);
+ 
+         // TODO: do other types of Character need to know their exported name?
+-        if let Some(character) = library.character_by_id(id) {
++        let character = library.borrow().character_by_id(id);
++        if let Some(character) = character {
+             if let Character::MovieClip(clip) = character {
+                 let data = Gc::write(mc, clip.0.shared.get());
+                 unlock!(data, MovieClipShared, exported_name).set(Some(name));
+@@ -4101,10 +4129,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+                 tracing::debug!("register_export asset: {} (ID: {})", name, export.id);
+ 
+                 if let Some(parent) = &importer_movie {
+-                    let parent_library = context.library.library_for_movie_mut(parent.clone());
++                    let parent_library = context
++                        .library
++                        .library_for_movie_mut(parent.clone(), context.gc());
+ 
+-                    if let Some(id) = parent_library.character_id_by_import_name(&name) {
+-                        parent_library.register_character(id, character);
++                    let import_id = parent_library.borrow().character_id_by_import_name(&name);
++                    if let Some(id) = import_id {
++                        parent_library
++                            .borrow_mut(context.gc())
++                            .register_character(id, character);
+ 
+                         Self::register_export(context, id, name, parent.clone());
+                         tracing::debug!(
+@@ -4357,11 +4390,12 @@ impl<'gc, 'a> MovieClip<'gc> {
+ 
+             let movie = self.movie();
+ 
+-            let library = activation
++            let domain = activation
+                 .context
+                 .library
+-                .library_for_movie_mut(movie.clone());
+-            let domain = library.avm2_domain();
++                .library_for_movie_mut(movie.clone(), activation.gc())
++                .borrow()
++                .avm2_domain();
+ 
+             for (class_name, id) in eager_tags.symbolclass_names {
+                 let name = AvmString::new(activation.gc(), class_name);
+@@ -4377,12 +4411,14 @@ impl<'gc, 'a> MovieClip<'gc> {
+                                 id,
+                             );
+ 
+-                        let library = activation
++                        let character = activation
+                             .context
+                             .library
+-                            .library_for_movie_mut(movie.clone());
++                            .library_for_movie_mut(movie.clone(), activation.gc())
++                            .borrow()
++                            .character_by_id(id);
+ 
+-                        match library.character_by_id(id) {
++                        match character {
+                             Some(Character::EditText(edit_text)) => {
+                                 edit_text.set_avm2_class(activation.gc(), class_object)
+                             }
+@@ -4428,12 +4464,12 @@ impl<'gc, 'a> MovieClip<'gc> {
+ 
+                                 let instantiated = self.instantiate(activation.gc());
+ 
+-                                let library = activation
++                                activation
+                                     .context
+                                     .library
+-                                    .library_for_movie_mut(movie.clone());
+-
+-                                library.register_character(id, Character::MovieClip(instantiated));
++                                    .library_for_movie_mut(movie.clone(), activation.gc())
++                                    .borrow_mut(activation.gc())
++                                    .register_character(id, Character::MovieClip(instantiated));
+                             }
+                             _ => {
+                                 tracing::warn!(
+@@ -4813,12 +4849,19 @@ impl<'gc> MovieClipShared<'gc> {
+         self.movie.clone()
+     }
+ 
+-    fn library<'a>(&self, context: &'a UpdateContext<'gc>) -> Option<&'a MovieLibrary<'gc>> {
+-        context.library.library_for_movie(self.movie())
++    fn library(&self, context: &UpdateContext<'gc>) -> Option<Ref<'gc, MovieLibrary<'gc>>> {
++        context
++            .library
++            .library_for_movie(self.movie(), context.gc())
++            .map(|library| library.borrow())
+     }
+ 
+-    fn library_mut<'a>(&self, context: &'a mut UpdateContext<'gc>) -> &'a mut MovieLibrary<'gc> {
+-        context.library.library_for_movie_mut(self.movie())
++    /// A short-lived borrow: never keep it across anything that may use this movie's library.
++    fn library_mut(&self, context: &mut UpdateContext<'gc>) -> RefMut<'gc, MovieLibrary<'gc>> {
++        context
++            .library
++            .library_for_movie_mut(self.movie(), context.gc())
++            .borrow_mut(context.gc())
+     }
+ 
+     fn take_eager_tags(&self, frame: FrameNumber) -> Option<EagerTags> {
+diff --git a/core/src/display_object/text.rs b/core/src/display_object/text.rs
+index 5d5eb147a..bdff860a2 100644
+--- a/core/src/display_object/text.rs
++++ b/core/src/display_object/text.rs
+@@ -91,8 +91,9 @@ impl<'gc> Text<'gc> {
+ 
+             let font = context
+                 .library
+-                .library_for_movie(self.movie())
++                .library_for_movie(self.movie(), context.gc())
+                 .unwrap()
++                .borrow()
+                 .get_font(font_id?)?;
+ 
+             for glyph in &block.glyphs {
+@@ -122,7 +123,8 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
+     fn replace_with(self, context: &mut UpdateContext<'gc>, id: CharacterId) {
+         if let Some(new_text) = context
+             .library
+-            .library_for_movie_mut(self.movie())
++            .library_for_movie_mut(self.movie(), context.gc())
++            .borrow()
+             .get_text(id)
+         {
+             self.set_shared(context, new_text.0.shared.get());
+@@ -160,8 +162,9 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
+             height = block.height.unwrap_or(height);
+             if let Some(font) = context
+                 .library
+-                .library_for_movie(self.movie())
++                .library_for_movie(self.movie(), context.gc())
+                 .unwrap()
++                .borrow()
+                 .get_font(font_id)
+             {
+                 let scale = (height.get() as f32) / font.scale();
+@@ -228,8 +231,9 @@ impl<'gc> TDisplayObject<'gc> for Text<'gc> {
+ 
+                 if let Some(font) = context
+                     .library
+-                    .library_for_movie(self.movie())
++                    .library_for_movie(self.movie(), context.gc())
+                     .unwrap()
++                    .borrow()
+                     .get_font(font_id)
+                 {
+                     let scale = (height.get() as f32) / font.scale();
+diff --git a/core/src/external.rs b/core/src/external.rs
+index 28733925d..835bf9ae0 100644
+--- a/core/src/external.rs
++++ b/core/src/external.rs
+@@ -310,8 +310,9 @@ impl<'gc> Callback<'gc> {
+             Callback::Avm2 { method } => {
+                 let domain = context
+                     .library
+-                    .library_for_movie(context.root_swf.clone())
++                    .library_for_movie(context.root_swf.clone(), context.gc())
+                     .unwrap()
++                    .borrow()
+                     .avm2_domain();
+                 let mut activation = Avm2Activation::from_domain(context, domain);
+                 let args: Vec<Avm2Value> = args
+diff --git a/core/src/html/layout/context.rs b/core/src/html/layout/context.rs
+index 4fc8fc4c3..d765f695d 100644
+--- a/core/src/html/layout/context.rs
++++ b/core/src/html/layout/context.rs
+@@ -47,8 +47,14 @@ impl<'gc> LayoutContext<'gc> for UpdateContext<'gc> {
+         is_italic: bool,
+         movie: Option<Arc<SwfMovie>>,
+     ) -> Option<Font<'gc>> {
+-        self.library
+-            .get_embedded_font_by_name(name, font_type, is_bold, is_italic, movie)
++        self.library.get_embedded_font_by_name(
++            name,
++            font_type,
++            is_bold,
++            is_italic,
++            movie,
++            self.gc(),
++        )
+     }
+ 
+     fn default_font(
+@@ -98,8 +104,14 @@ impl<'gc> LayoutContext<'gc> for RenderContext<'_, 'gc> {
+         is_italic: bool,
+         movie: Option<Arc<SwfMovie>>,
+     ) -> Option<Font<'gc>> {
+-        self.library
+-            .get_embedded_font_by_name(name, font_type, is_bold, is_italic, movie)
++        self.library.get_embedded_font_by_name(
++            name,
++            font_type,
++            is_bold,
++            is_italic,
++            movie,
++            self.gc(),
++        )
+     }
+ 
+     fn default_font(
+diff --git a/core/src/html/text_format.rs b/core/src/html/text_format.rs
+index 75cf86358..4d4756832 100644
+--- a/core/src/html/text_format.rs
++++ b/core/src/html/text_format.rs
+@@ -200,8 +200,12 @@ impl TextFormat {
+     ) -> Self {
+         let encoding = swf_movie.encoding();
+         let swf_version = swf_movie.version();
+-        let movie_library = context.library.library_for_movie_mut(swf_movie);
+-        let font = et.font_id().and_then(|fid| movie_library.get_font(fid));
++        let movie_library = context
++            .library
++            .library_for_movie_mut(swf_movie, context.gc());
++        let font = et
++            .font_id()
++            .and_then(|fid| movie_library.borrow().get_font(fid));
+         let font_class = et
+             .font_class()
+             .map(|s| s.decode(encoding).into_owned())
+diff --git a/core/src/library.rs b/core/src/library.rs
+index 74188cd5e..51501a9eb 100644
+--- a/core/src/library.rs
++++ b/core/src/library.rs
+@@ -9,7 +9,8 @@ use crate::prelude::*;
+ use crate::string::AvmString;
+ use crate::tag_utils::SwfMovie;
+ use gc_arena::collect::Trace;
+-use gc_arena::{Collect, Mutation};
++use gc_arena::lock::RefLock;
++use gc_arena::{Collect, Gc, GcWeak, Mutation};
+ use ruffle_render::backend::RenderBackend;
+ use ruffle_render::bitmap::BitmapHandle;
+ use ruffle_render::utils::remove_invalid_jpeg_data;
+@@ -20,7 +21,7 @@ use crate::font::DefaultFont;
+ use fnv::{FnvHashMap, FnvHashSet};
+ use std::collections::HashMap;
+ use std::sync::{Arc, Weak};
+-use weak_table::{PtrWeakKeyHashMap, WeakValueHashMap, traits::WeakElement};
++use weak_table::{WeakValueHashMap, traits::WeakElement};
+ 
+ #[derive(Clone)]
+ struct MovieSymbol(Arc<SwfMovie>, CharacterId);
+@@ -116,6 +117,14 @@ impl<'gc> Avm2ClassRegistry<'gc> {
+     }
+ }
+ 
++/// A movie's library as the garbage collector sees it. PortMaster port: libraries are no longer
++/// kept forever. The registry in `Library` only holds them weakly; display objects keep the library
++/// of their movie alive (`DisplayObjectBase::library`), and libraries that must never go away (the
++/// root movie, AVM2 movies, anything not loaded by AVM1 `loadMovie`) are pinned. Once nothing of a
++/// loaded movie is alive, its library (characters, bitmaps and their textures, shapes, the SWF
++/// data) is collected.
++pub type MovieLibraryGc<'gc> = Gc<'gc, RefLock<MovieLibrary<'gc>>>;
++
+ /// Symbol library for a single given SWF.
+ #[derive(Collect)]
+ #[collect(no_drop)]
+@@ -400,37 +409,102 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
+     }
+ }
+ 
+-struct MovieLibraries<'gc>(PtrWeakKeyHashMap<Weak<SwfMovie>, MovieLibrary<'gc>>);
++/// The registry of movie libraries: weak, keyed by the movie's address (a live library holds its
++/// movie, so the address cannot be reused while the entry can still be upgraded), plus the pinned
++/// libraries, which are held strongly.
++struct MovieLibraries<'gc> {
++    weak: FnvHashMap<usize, (Weak<SwfMovie>, GcWeak<'gc, RefLock<MovieLibrary<'gc>>>)>,
++    pinned: Vec<MovieLibraryGc<'gc>>,
++    /// Movies whose libraries may be collected (AVM1 `loadMovie` content), by address
++    unpinned: FnvHashSet<usize>,
++}
+ 
+ unsafe impl<'gc> Collect<'gc> for MovieLibraries<'gc> {
+     #[inline]
+     fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
+-        for (_, val) in self.0.iter() {
+-            cc.trace(val);
++        for (_, weak) in self.weak.values() {
++            cc.trace(weak);
+         }
++        cc.trace(&self.pinned);
+     }
+ }
+ 
+ impl<'gc> MovieLibraries<'gc> {
+     fn new() -> Self {
+-        Self(PtrWeakKeyHashMap::new())
++        Self {
++            weak: FnvHashMap::default(),
++            pinned: Vec::new(),
++            unpinned: FnvHashSet::default(),
++        }
+     }
+ 
+-    fn get(&self, key: &Arc<SwfMovie>) -> Option<&MovieLibrary<'gc>> {
+-        self.0.get(key)
++    fn key(movie: &Arc<SwfMovie>) -> usize {
++        Arc::as_ptr(movie) as usize
+     }
+ 
+-    fn get_or_insert_mut(&mut self, movie: Arc<SwfMovie>) -> &mut MovieLibrary<'gc> {
+-        self.0
+-            .entry(movie.clone())
+-            .or_insert_with(|| MovieLibrary::new(movie))
++    fn get(&self, movie: &Arc<SwfMovie>, mc: &Mutation<'gc>) -> Option<MovieLibraryGc<'gc>> {
++        let (owner, weak) = self.weak.get(&Self::key(movie))?;
++        // The address of a dropped movie can be reused by a new one
++        if !std::ptr::eq(owner.as_ptr(), Arc::as_ptr(movie)) || owner.strong_count() == 0 {
++            return None;
++        }
++        weak.upgrade(mc)
++    }
++
++    fn get_or_insert(&mut self, movie: Arc<SwfMovie>, mc: &Mutation<'gc>) -> MovieLibraryGc<'gc> {
++        if let Some(library) = self.get(&movie, mc) {
++            return library;
++        }
++        let key = Self::key(&movie);
++        if self.weak.contains_key(&key) {
++            tracing::debug!(
++                "library of {} created again after it was collected",
++                movie.url()
++            );
++        }
++        let library = Gc::new(mc, RefLock::new(MovieLibrary::new(movie.clone())));
++        if !self.unpinned.contains(&key) {
++            self.pinned.push(library);
++        }
++        self.weak
++            .insert(key, (Arc::downgrade(&movie), Gc::downgrade(library)));
++        if self.weak.len() > 2 * self.pinned.len() + 32 {
++            self.prune(mc);
++        }
++        library
++    }
++
++    /// Lets the library of `movie` be collected once nothing of the movie is alive.
++    fn unpin(&mut self, movie: &Arc<SwfMovie>) {
++        let key = Self::key(movie);
++        self.unpinned.insert(key);
++        self.pinned
++            .retain(|library| !Arc::ptr_eq(&library.borrow().swf, movie));
++    }
++
++    /// Drops the registry entries of collected libraries.
++    fn prune(&mut self, mc: &Mutation<'gc>) {
++        self.weak
++            .retain(|_, (owner, weak)| owner.strong_count() > 0 && weak.upgrade(mc).is_some());
++        let weak = &self.weak;
++        self.unpinned.retain(|key| weak.contains_key(key));
+     }
+ 
+-    fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
+-        self.0.keys()
++    fn known_movies(&self, mc: &Mutation<'gc>) -> Vec<Arc<SwfMovie>> {
++        self.weak
++            .values()
++            .filter_map(|(_, weak)| weak.upgrade(mc))
++            .map(|library| library.borrow().swf.clone())
++            .collect()
+     }
+ }
+ 
++/// PortMaster port: `RUFFLE_FREE_LOADED_MOVIES` (default on, "0" turns it off).
++fn free_loaded_movies() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("RUFFLE_FREE_LOADED_MOVIES").as_deref() != Ok("0"))
++}
++
+ /// Symbol library for multiple movies.
+ #[derive(Collect)]
+ #[collect(no_drop)]
+@@ -478,16 +552,35 @@ impl<'gc> Library<'gc> {
+         }
+     }
+ 
+-    pub fn library_for_movie(&self, movie: Arc<SwfMovie>) -> Option<&MovieLibrary<'gc>> {
+-        self.movie_libraries.get(&movie)
++    /// The library of `movie`, if it has one.
++    pub fn library_for_movie(
++        &self,
++        movie: Arc<SwfMovie>,
++        mc: &Mutation<'gc>,
++    ) -> Option<MovieLibraryGc<'gc>> {
++        self.movie_libraries.get(&movie, mc)
+     }
+ 
+-    pub fn library_for_movie_mut(&mut self, movie: Arc<SwfMovie>) -> &mut MovieLibrary<'gc> {
+-        self.movie_libraries.get_or_insert_mut(movie)
++    /// The library of `movie`, created (empty) if it has none.
++    pub fn library_for_movie_mut(
++        &mut self,
++        movie: Arc<SwfMovie>,
++        mc: &Mutation<'gc>,
++    ) -> MovieLibraryGc<'gc> {
++        self.movie_libraries.get_or_insert(movie, mc)
+     }
+ 
+-    pub fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
+-        self.movie_libraries.known_movies()
++    /// PortMaster port: lets the library of `movie` (AVM1 `loadMovie` content) be collected once
++    /// no display object of the movie is alive. `RUFFLE_FREE_LOADED_MOVIES=0` keeps every library
++    /// for the life of the player, as upstream Ruffle does.
++    pub fn unpin_movie_library(&mut self, movie: &Arc<SwfMovie>) {
++        if free_loaded_movies() {
++            self.movie_libraries.unpin(movie);
++        }
++    }
++
++    pub fn known_movies(&self, mc: &Mutation<'gc>) -> Vec<Arc<SwfMovie>> {
++        self.movie_libraries.known_movies(mc)
+     }
+ 
+     /// Returns the default Font implementations behind the built in names (ie `_sans`)
+@@ -716,14 +809,16 @@ impl<'gc> Library<'gc> {
+         is_bold: bool,
+         is_italic: bool,
+         movie: Option<Arc<SwfMovie>>,
++        mc: &Mutation<'gc>,
+     ) -> Option<Font<'gc>> {
+         let query = FontQuery::new(font_type, name.to_owned(), is_bold, is_italic);
+         if let Some(font) = self.global_fonts.find(&query) {
+             return Some(font);
+         }
+         if let Some(movie) = movie
+-            && let Some(library) = self.library_for_movie(movie)
++            && let Some(library) = self.library_for_movie(movie, mc)
+         {
++            let library = library.borrow();
+             if let Some((_, font)) = library.character_by_export_name(&WString::from_utf8(name)) {
+                 // Exporting a font seems to override font lookup completely.
+                 return if let Character::Font(font) = font {
+diff --git a/core/src/loader.rs b/core/src/loader.rs
+index 5d69fb97b..c17058b35 100644
+--- a/core/src/loader.rs
++++ b/core/src/loader.rs
+@@ -366,7 +366,7 @@ impl<'gc> LoadManager<'gc> {
+                             tracing::debug!("Preloading swf to run exports {:?}", url);
+ 
+                             // Create library for exports before preloading
+-                            uc.library.library_for_movie_mut(clip.movie());
++                            uc.library.library_for_movie_mut(clip.movie(), uc.gc());
+                             let res = clip.preload(uc, &mut execution_limit);
+                             tracing::debug!(
+                                 "Preloaded swf to run exports result {:?} {}",
+@@ -1725,6 +1725,11 @@ impl<'gc> MovieLoader<'gc> {
+             }
+             ContentType::Unknown => Arc::new(SwfMovie::error_movie(url.clone())),
+         };
++        // PortMaster port: content loaded by AVM1 (loadMovie, MovieClipLoader) may be collected
++        // once none of its display objects is alive
++        if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
++            uc.library.unpin_movie_library(&movie);
++        }
+ 
+         match uc.load_manager.get_loader_mut(handle) {
+             Some(Self {
+@@ -1770,9 +1775,10 @@ impl<'gc> MovieLoader<'gc> {
+ 
+         match sniffed_type {
+             ContentType::Swf => {
+-                let library = uc.library.library_for_movie_mut(movie.clone());
+-
+-                library.set_avm2_domain(domain);
++                uc.library
++                    .library_for_movie_mut(movie.clone(), uc.gc())
++                    .borrow_mut(uc.gc())
++                    .set_avm2_domain(domain);
+ 
+                 if let Some(mc) = clip.as_movie_clip() {
+                     let loader_info = if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
+@@ -1858,9 +1864,12 @@ impl<'gc> MovieLoader<'gc> {
+             ContentType::Gif | ContentType::Jpeg | ContentType::JpegXr | ContentType::Png => {
+                 let mut activation = Avm2Activation::from_nothing(uc);
+ 
+-                let library = activation.context.library.library_for_movie_mut(movie);
+-
+-                library.set_avm2_domain(domain);
++                activation
++                    .context
++                    .library
++                    .library_for_movie_mut(movie, activation.gc())
++                    .borrow_mut(activation.gc())
++                    .set_avm2_domain(domain);
+ 
+                 // This will construct AVM2-side objects even under AVM1, but it doesn't matter,
+                 // since Bitmap and BitmapData never have AVM1-side objects.
+-- 
+2.43.0
+

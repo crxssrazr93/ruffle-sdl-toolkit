@@ -6,7 +6,7 @@ Read this when a Flash or AIR game runs out of memory on a handheld (the process
 
 ## The strategy in one paragraph
 
-Ruffle never frees a loaded movie's resources, so the only complete release is process exit. The toolkit therefore (1) restarts the process at every big content boundary (relaunch per sub movie), (2) makes each movie cheaper to hold (lazy shapes, no resident blank pixels, in place draws), (3) paces the garbage collector for a language runtime that does not count its buffers, and (4) gives you accounting (`RUFFLE_MEMLOG`) so you fix what is actually big instead of what you suspect.
+Upstream Ruffle never frees a loaded movie's resources. Patch 0014 frees the movies that AVM1 loaded (`loadMovie`, `MovieClipLoader`) once nothing of them is alive, but the main movie and everything loaded through AVM2 (`Loader`) stay until the process exits, so for those the only complete release is still process exit. The toolkit therefore (1) restarts the process at every big content boundary (relaunch per sub movie), (2) makes each movie cheaper to hold (lazy shapes, no resident blank pixels, in place draws), (3) paces the garbage collector for a language runtime that does not count its buffers, and (4) gives you accounting (`RUFFLE_MEMLOG`) so you fix what is actually big instead of what you suspect.
 
 Measure before you blame the content. In the case that drove this work, the game's own level bitmap cache was only about 31 MB. Ruffle's eager preparation of every shape in a world SWF dominated, and that only became visible through `RUFFLE_MEMLOG`.
 
@@ -22,11 +22,25 @@ Measure before you blame the content. In the case that drove this work, the game
 * State crosses the boundary only through `SharedObject` saves and the boot flashvars.
 * Expect a short black screen at each world change. Tell players that is Ruffle restarting to free memory.
 
-**Why it works.** Every loaded SWF gets a `MovieLibrary` in Ruffle holding parsed characters, GPU bitmap handles and tessellated meshes for the life of the process. The container is a `HashMap<SwfMovie, MovieLibrary>` in `core/src/library.rs` that only grows. `LoaderInfo::unload()` merely detaches the display object, a `BitmapCharacter` caches its GPU handle, and a revisited movie allocates a new library. On a shared memory GPU (Mali), that GPU memory is system RAM. This is upstream issue https://github.com/ruffle-rs/ruffle/issues/24864 (open). Upstream PR #23071, "Fix memory leaks by making MovieLibrary garbage-collectable", was still open and conflicting with a stalled branch when this was written. Do not wait for it. If it lands, re-evaluate whether you still need a relaunch.
+**Why it works.** Every loaded SWF gets a `MovieLibrary` in Ruffle holding parsed characters, GPU bitmap handles and tessellated meshes for the life of the process (with 0014 only for AVM2 and the root movie, see below). The container is a `HashMap<SwfMovie, MovieLibrary>` in `core/src/library.rs` that only grows. `LoaderInfo::unload()` merely detaches the display object, a `BitmapCharacter` caches its GPU handle, and a revisited movie allocates a new library. On a shared memory GPU (Mali), that GPU memory is system RAM. This is upstream issue https://github.com/ruffle-rs/ruffle/issues/24864 (open). Upstream PR #23071, "Fix memory leaks by making MovieLibrary garbage-collectable", was still open and conflicting with a stalled branch when this was written. Do not wait for it. If it lands, re-evaluate whether you still need a relaunch.
 
 Upstream measurements of the same leak: 2.0 to 3.7 GB of VRAM over 13 load and unload cycles on a 4 GB desktop GPU, then `wgpu error: Out of Memory`. Related reports: #22759, #19682, #16889, #10263, #24415 and discussion #24870.
 
 **What relaunch does not fix.** One movie whose own preload is too big for the device. That is what the next sections address.
+
+## Freeing movies loaded by AVM1 (0014)
+
+**What it does.** Every loaded SWF gets a `MovieLibrary`. Upstream keeps it in a map that holds the movie weakly, but the library itself holds the movie strongly, so the entry never goes away (the cause of ruffle-rs/ruffle#24864). With 0014 a library is a garbage collected object (`MovieLibraryGc`). The registry holds it weakly, and every display object keeps the library of its own movie alive (set when the object gets a parent, and when a movie is loaded into a clip). When the last display object of a movie is gone, the next collections free the library: characters, bitmaps and their GPU textures, tessellated shapes and the SWF data.
+
+**What it covers.** Only movies loaded by AVM1 (`loadMovie`, `loadMovieNum`, `MovieClipLoader`, including JPEG, PNG and GIF loads) and placeholder movies without data (an unloaded clip, the loading and error stand-ins). Their libraries are "unpinned". All other libraries are pinned, which is the old behaviour: the root movie, and everything loaded through AVM2 `Loader` (including AVM1 movies loaded by AVM2). An AS3 shell that loads AS2 worlds therefore still needs the relaunch per world, but levels and screens that the AS2 world itself loads and unloads are freed.
+
+**Switch.** `RUFFLE_FREE_LOADED_MOVIES=0` pins every library again, as upstream.
+
+**Measured.** Machinarium (AVM1, a SWF per scene, per hint book page and per animation) in one scene, the hint book opened and closed 20 times with the series and 0014 built from this toolkit (x86_64, Xvfb, Mesa llvmpipe): RSS 262 -> 265 MB, with `RUFFLE_FREE_LOADED_MOVIES=0` 297 -> 347 MB. The same loop on an RG Cube XX (Knulli, Mali-G31, aarch64 build of the same tree with `build-aarch64-native.sh`): RSS 276 to 298 MB over the 20 cycles with no trend. An earlier build without the change was out of memory killed there after about 4 minutes of play. Fancy Pants World 2 Level 1 and World 3 Level 4 (started directly by flashvars, 45 s with some running) on the PC: peak RSS 277 and 348 MB on, 287 and 346 MB off, the same pictures. Ruffle's own regression tests `avm1/`, `avm2/`, `import_assets/`, `fonts/` and `mixed_avm/` pass with and without 0014 (1962 tests, release build on the pinned commit with the series).
+
+**Accounting.** With `RUFFLE_MEMLOG` the compressed library bitmaps and parsed shape records leave the `Library` category when their library is freed (they were counted as never freed before).
+
+**Not freed.** Sounds of a freed movie stay registered in the audio backend (the mixer keeps its decoded sound data). Content loaded through AVM2 `Loader` stays pinned: `Loader.unload()` still frees nothing.
 
 ## Making one movie cheaper
 
@@ -155,7 +169,8 @@ An allocator budget note if you extend accounting: on backends with `Device::gen
 * Lazy shapes shift cost to the first display of content. A hitch on first view is expected.
 * A relaunch needs the game to persist its own state (SharedObject) before calling the fscommand.
 * Hotkey exit (143, 137) and OOM kill (137) look alike. Use `dmesg`.
-* Do not rely on `PR #23071`. Plan for relaunch until upstream proves otherwise.
+* Do not rely on `PR #23071`. Plan for relaunch until upstream proves otherwise, except for content that AVM1 loads and unloads, which 0014 frees.
+* 0014 frees a library once no display object of its movie is alive. A script that keeps only a function of an unloaded movie and later attaches that movie's symbols finds them missing (the library is created again, empty, with a debug log line `library of ... created again after it was collected`). `RUFFLE_FREE_LOADED_MOVIES=0` rules this out.
 
 ## See also
 

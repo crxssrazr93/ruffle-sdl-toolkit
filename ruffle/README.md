@@ -10,7 +10,7 @@ Ruffle itself is MIT OR Apache-2.0. The patches stay under that license with eac
 |-|-|
 | `PIN` | Full 40 character upstream commit the series applies to |
 | `series` | Patch file names in apply order (`#` comments allowed) |
-| `patches/` | The default series, 0001 to 0013 |
+| `patches/` | The default series, 0001 to 0014 |
 | `optional/` | Patches that are not in the default series (for example 0100, the software cursor overlay) |
 | `fetch.sh [dir]` | Clone the pin and `git am` the series. `RUFFLE_REPO` overrides the clone source, `WITH_OPTIONAL="0100"` adds optional patches |
 | `build-aarch64.sh <src> <out>` | Docker cross build, glibc 2.30 floor (ubuntu:20.04). Prints the max GLIBC version and NEEDED libraries |
@@ -32,7 +32,7 @@ ruffle/build-x86_64.sh work/ruffle-src work/out-pc
 
 ## The patches
 
-Credit: patches 0001 to 0004 and 0013 are by crxssrazr93. The `ruffle_sdl` front end (0006) and the memory patches 0005 and 0007 to 0012 are by Knifethrower (contributed as GitHub PR #1 on the example port repo), and carry the author line `port <port@localhost>` from the original export. Do not rewrite those author lines.
+Credit: patches 0001 to 0004 and 0013 are by crxssrazr93. The `ruffle_sdl` front end (0006) and the memory patches 0005 and 0007 to 0012 are by Knifethrower (contributed as GitHub PR #1 on the example port repo), and carry the author line `port <port@localhost>` from the original export. Do not rewrite those author lines. Patch 0014 is by Knifethrower, with that author line.
 
 Env vars are read at run time. "Generic" means the patch has no game specific behaviour.
 
@@ -51,6 +51,7 @@ Env vars are read at run time. "Generic" means the patch has no game specific be
 | 0011 | Stage3D uploads without a submit, consecutive draws in one render pass | Knifethrower | RUFFLE_S3D_DEFER_UPLOAD (on), RUFFLE_S3D_MERGE_PASSES (on), PM_GPUSTAT (off) | Yes. PM_GPUSTAT has a port prefix in its name |
 | 0012 | ruffle_sdl: run with SDL 2.0.10 | Knifethrower | none | Yes |
 | 0013 | ruffle_sdl: minimum key hold, so games that poll keys see short taps | crxssrazr93 | RUFFLE_MIN_KEY_HOLD_MS (100, 0 off) | Yes |
+| 0014 | core: free the libraries of movies loaded by AVM1 once nothing uses them | Knifethrower | RUFFLE_FREE_LOADED_MOVIES (on, 0 off) | Yes, upstream issue ruffle-rs/ruffle#24864 |
 
 Note: in 0002 and 0006 the relaunch fscommand prints `RUFFLE_RELAUNCH <args>` on stdout and exits, so a launch script can restart the binary with new arguments. These two patches were lightly edited after export (marker name and prose only, no author lines changed) so that the series carries no game specific names. The temporary PORT_EXP experiment from the early Stage3D work is removed within the series (0003), so nothing needs deleting.
 

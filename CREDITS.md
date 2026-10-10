@@ -20,6 +20,7 @@ Author of the `ruffle_sdl` front end (patch 0006: Ruffle on SDL2 and GLES 3 for 
 * 0010 memory accounting by category (`RUFFLE_MEMLOG`)
 * 0011 Stage3D uploads without a submit, consecutive draws in one render pass
 * 0012 `ruffle_sdl` on SDL 2.0.10
+* 0014 core: free the libraries of movies loaded by AVM1 once nothing uses them (author line Knifethrower)
 
 These were contributed through pull request #1 on the example repository (see `examples/README.md`). In the original history the author line reads "port <port@localhost>", which is a placeholder identity and not the author. The credit belongs to Knifethrower.
 

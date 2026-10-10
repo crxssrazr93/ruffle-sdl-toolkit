@@ -34,7 +34,7 @@ Start with [01 Feasibility](docs/01-feasibility.md): run every SWF headless on t
 Every command below is run from the repository root.
 
 1. Read [01 Feasibility](docs/01-feasibility.md) and triage your game on the PC (`python3 tools/swf/swf_info.py MYGAME/*.swf`).
-2. Get the patched Ruffle and build it. `ruffle/fetch.sh ./src` clones the pinned commit and applies the series 0001 to 0013 (add `WITH_OPTIONAL="0100"` for an optional patch such as the software cursor, if present). Then `ruffle/build-aarch64.sh ./src ./out` (needs Docker) for the device and `ruffle/build-x86_64.sh ./src ./out-x86` for the PC (needs the SDL2 and ALSA development packages).
+2. Get the patched Ruffle and build it. `ruffle/fetch.sh ./src` clones the pinned commit and applies the series 0001 to 0014 (add `WITH_OPTIONAL="0100"` for an optional patch such as the software cursor, if present). Then `ruffle/build-aarch64.sh ./src ./out` (needs Docker) for the device and `ruffle/build-x86_64.sh ./src ./out-x86` for the PC (needs the SDL2 and ALSA development packages).
 3. Decompile the shell and SWFs with `tools/swf/ffdec.sh as3 MYGAME.swf work/dec Main` (set `FFDEC` to your ffdec first), then write your patches with the `anchor.py` library, starting from `tools/swf/example_patch.py` (see [02 Shell patching](docs/02-shell-patching.md)).
 4. Handle screen size: aspect modes and the audit of fixed height constants ([08](docs/08-screen-aspect.md)).
 5. Map the pad with a gptk, and add what the game lacks (volume keys, a cursor) ([09](docs/09-input.md)).
@@ -75,7 +75,8 @@ This section is maintained by hand. Update it when you verify something.
 
 | Area | Status | Notes |
 |-|-|-|
-| Patch series 0001 to 0013 applies to the pinned commit | verified | `ruffle/fetch.sh` applies it cleanly on the pinned commit |
+| Patch series 0001 to 0014 applies to the pinned commit | verified | `ruffle/fetch.sh` applies it cleanly on the pinned commit |
+| Freeing AVM1 loaded movies (0014) | verified on PC and one handheld | Machinarium hint book loop on PC (262 -> 265 MB, 297 -> 347 MB with the switch off) and on an RG Cube XX (276 to 298 MB over the 20 cycles, no trend); Ruffle regression groups avm1, avm2, import_assets, fonts, mixed_avm pass with and without it (1962 tests); Fancy Pants World 2 L1 and World 3 L4 unchanged on PC. AVM2 `Loader` content is still not freed, see docs/05-memory.md |
 | x86_64 `ruffle_sdl` build from the series | verified | release build, about 3.5 minutes |
 | aarch64 build (Docker) and glibc floor | verified | `ruffle/build-aarch64.sh` built `ruffle_sdl` from the 0001 to 0013 series: 16.7 MB, max GLIBC_2.30, needs libSDL2, libasound, libdl, libgcc_s, libpthread, libm, libc. The script fails above `MAX_GLIBC` (default 2.30). `atftool` also built for aarch64 (652 KB, glibc 2.30) |
 | aarch64 binary under qemu | verified for start and exit | The toolkit built `ruffle_sdl` ran the relaunch fixture under qemu user mode: started, ran the AVM1 movie, printed `RUFFLE_RELAUNCH next`, exit 0. Emulation only, no GPU, no real handheld |

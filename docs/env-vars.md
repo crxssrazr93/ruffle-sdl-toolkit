@@ -12,7 +12,7 @@ Truthiness is not uniform, and the difference causes real mistakes. There are th
 |-|-|-|
 | Set means on (`var_os().is_some()`) | `RUFFLE_FPS_LOG`, `RUFFLE_AS3_PROF`, `RUFFLE_SDL_TIMING`, `PM_GPUSTAT` | Any value, including `0` and an empty string, turns it on. Unset it to turn it off. |
 | Opt in, not empty and not `0` | `RUFFLE_LAZY_MOUSE_PICK`, `RUFFLE_FRAMESKIP`, `RUFFLE_MEMLOG` | Off when unset, empty or `0`. (One extra `RUFFLE_MEMLOG` log line, the SWF size line, is gated on the variable merely being set.) |
-| Default on, `0` disables | `RUFFLE_LAZY_SHAPES`, `RUFFLE_LAZY_SHAPE_RECORDS`, `RUFFLE_DRAW_IN_PLACE`, `RUFFLE_ZEROED_PIXELS`, `RUFFLE_EMPTY_TEXTURES`, `RUFFLE_S3D_DEFER_UPLOAD`, `RUFFLE_S3D_MERGE_PASSES` | On unless the value is exactly `0`. |
+| Default on, `0` disables | `RUFFLE_LAZY_SHAPES`, `RUFFLE_LAZY_SHAPE_RECORDS`, `RUFFLE_DRAW_IN_PLACE`, `RUFFLE_ZEROED_PIXELS`, `RUFFLE_EMPTY_TEXTURES`, `RUFFLE_S3D_DEFER_UPLOAD`, `RUFFLE_S3D_MERGE_PASSES`, `RUFFLE_FREE_LOADED_MOVIES` | On unless the value is exactly `0`. |
 | Numeric with default | `RUFFLE_GC_STEP`, `RUFFLE_TRIM_SECS`, `RUFFLE_GC_LONG_TICK`, `RUFFLE_DRAW_POOL_MB`, `RUFFLE_MIN_KEY_HOLD_MS`, `RUFFLE_MEMLOG_MS`, `RUFFLE_MEMLOG_TOP` | An unparsable value silently falls back to the default. `0` turns the feature off where the table says so. |
 
 Values are read once at first use and cached for the life of the process. Change them before launching.
@@ -38,6 +38,7 @@ Owner means who wrote it: K is Knifethrower, C is crxssrazr93, U is upstream or 
 | `RUFFLE_DRAW_POOL_MB` | `16` | Submit and empty the offscreen pool after this many MB of pooled draws. `0` off. | Lower on tight memory. Higher if the extra submits cost fps. | 0008 | K |
 | `RUFFLE_ZEROED_PIXELS` | on | Zeroed allocation (calloc) for blank BitmapData pixels. | `0` to compare. | 0009, `core/src/bitmap/bitmap_data.rs` | K |
 | `RUFFLE_EMPTY_TEXTURES` | on | GPU zero init for blank bitmap textures, no zero upload. | `0` if a driver mishandles zero init. | 0009 | K |
+| `RUFFLE_FREE_LOADED_MOVIES` | on | Free the library of a movie loaded by AVM1 (`loadMovie`, `MovieClipLoader`, images too) once none of its display objects is alive. `0` keeps every library for the life of the process, as upstream Ruffle does. | `0` to rule out a missing symbol after an unload, or to compare memory. | 0014, `core/src/library.rs` | K |
 | `RUFFLE_MEMLOG` | off | Category accounting plus an RSS sampler thread. Needs `RUST_LOG=...memlog=info` to be visible. | Investigating an OOM. | 0010, `render/src/memlog.rs` | K |
 | `RUFFLE_MEMLOG_MS` | `100` | RSS sample period in ms. | Finer or coarser. | 0010 | K |
 | `RUFFLE_MEMLOG_TOP` | `8` | Items listed per category at each new peak. | Deeper dumps. | 0010 | K |
