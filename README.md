@@ -89,7 +89,10 @@ This section is maintained by hand. Update it when you verify something.
 | `--visible=vnc` viewing mode | verified | server starts, listens on localhost only, cleaned up |
 | `--visible=xephyr` and gamescope `--visible` | not verified | Xephyr is not installed here, and checking gamescope visible opens a window |
 | `device.sh` and `keyd.py` | not verified | never run (they need a device and uinput) |
-| Software cursor (all five approaches) | planned | see docs/09-input.md |
+| Software cursor, front end overlay (optional patch 0100) | verified headless | 8 of 8 pixel cases in `tests/cursor_test.sh` on x86_64 Xvfb: arrow appears under the pointer after motion, disappears after the idle time, works with `--render-size`, a PNG image and an animated movie, and is pixel identical to an unpatched build when off. Not run on a real GPU, Mali, KMSDRM or SDL 2.0.10 |
+| Software cursor, SDL colour cursor | creation only | The cursor is built; being drawn by the video driver it cannot appear in the GL capture, so visibility is unverified |
+| Software cursor, shell side AS2 and AS3 overlays | verified headless | Snippets compiled by ffdec into small movies and checked by the same pixel test. Not tried in a real game shell |
+| Software cursor, gptokeyb pointer source | documented only | Pairs with any of the above, see docs/09-input.md |
 | Right stick mouse end to end on a device | needs a device | |
 | 1920x1080 frame rate | needs a device | never measured |
 | Launcher template on a device | needs a device | nothing in this toolkit has been tested on a real handheld |
