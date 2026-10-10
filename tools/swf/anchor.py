@@ -133,10 +133,12 @@ class Patch:
         self.log.append(("insert_before " + anchor.strip()[:40], count))
 
     def forbid(self, identifiers, word=True):
-        """Exit if any identifier is still referenced. Whole word match by default."""
+        """Exit if any identifier is still referenced. Whole word match by default. A name after a dot
+        (flash.desktop.NativeApplication, obj.File) counts as a hit on purpose: a leftover scan should
+        fail loudly, and a false positive is cheap to look at."""
         left = []
         for ident in identifiers:
-            rx = re.compile((r"(?<![\w$.])" + re.escape(ident) + r"(?![\w$])") if word and ident.isidentifier()
+            rx = re.compile((r"(?<![\w$])" + re.escape(ident) + r"(?![\w$])") if word and ident.isidentifier()
                             else re.escape(ident))
             hits = [self.src.count("\n", 0, m.start()) + 1 for m in rx.finditer(self.src)]
             if hits:

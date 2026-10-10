@@ -64,6 +64,7 @@ if [ "$VIEW" = auto ]; then
 fi
 [ $# -ge 3 ] || usage
 BIN=$(readlink -f "$1"); SWF=$(readlink -f "$2"); OUT=$3; SECS=${4:-6}
+case "$SECS" in ''|*[!0-9]*) echo "seconds must be a number, got: $SECS (extra args go after the seconds slot)" >&2; exit 2 ;; esac
 shift 3; [ $# -gt 0 ] && shift
 EXTRA=("$@")
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 2; }

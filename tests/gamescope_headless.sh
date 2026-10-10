@@ -42,6 +42,7 @@ case "$VIEW" in headless|visible) ;; *) echo "bad VIEW: $VIEW" >&2; exit 2 ;; es
 case "$HOLD" in ''|*[!0-9]*) echo "--hold needs a number" >&2; exit 2 ;; esac
 [ $# -ge 3 ] || usage
 BIN=$(readlink -f "$1"); SWF=$(readlink -f "$2"); OUT=$3; SECS=${4:-8}
+case "$SECS" in ''|*[!0-9]*) echo "seconds must be a number, got: $SECS (extra args go after the seconds slot)" >&2; exit 2 ;; esac
 shift 3; [ $# -gt 0 ] && shift
 EXTRA=("$@")
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 2; }
@@ -52,6 +53,8 @@ RES=${RES:-640x480}; W=${RES%x*}; H=${RES#*x}
 
 XDG=$(mktemp -d /tmp/ruffle-gs-xdg.XXXXXX); chmod 700 "$XDG"
 INNER=$(mktemp /tmp/ruffle-gs-inner.XXXXXX)
+# extra ruffle_sdl args, shell quoted so spaces and quotes survive the generated inner script
+EXTRA_Q=""; [ ${#EXTRA[@]} -gt 0 ] && EXTRA_Q=$(printf ' %q' "${EXTRA[@]}")
 GP=""; KP=""
 cleanup() {
   [ -n "$GP" ] && kill -9 -- "-$GP" 2>/dev/null   # the whole group started with setsid
@@ -71,7 +74,7 @@ export RUST_LOG="${RUST_LOG:-warn,ruffle_sdl=info,avm_trace=info}"
 export RUFFLE_SDL_SHOT="$OUT" RUFFLE_SDL_SHOT_AT="${SHOT_AT:-2s}" RUFFLE_SDL_KEYS="$OUT/keys.txt"
 export RUFFLE_SDL_EXIT_AFTER_SHOTS="${EXIT_AFTER_SHOTS:-0}"
 echo "inner DISPLAY=\$DISPLAY" >&2
-exec "$BIN" --width "$W" --height "$H" --save-directory "$OUT/saves" ${EXTRA[*]:-} "$SWF"
+exec "$BIN" --width "$W" --height "$H" --save-directory "$OUT/saves" ${EXTRA_Q} "$SWF"
 INNER_EOF
 chmod +x "$INNER"
 
