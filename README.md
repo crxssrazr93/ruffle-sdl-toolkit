@@ -68,7 +68,6 @@ Every command below is run from the repository root.
 | `templates/port/` | Launcher, port folder, metadata, README and submission templates |
 | `tests/` | PC and device harnesses, capture hook, fixtures |
 | `examples/` | Pointer to a finished port |
-| `INVENTORY.md` | The evidence base the docs were written from |
 
 ## Verification status
 

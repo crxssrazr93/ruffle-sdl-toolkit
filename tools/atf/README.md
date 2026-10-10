@@ -37,7 +37,7 @@ Scaling textures can damage pixel art. Prefer lossless factors (exact 2x or 4x) 
 
 ## ATF format notes
 
-Source: INVENTORY.md section 07, checked against Adobe's encoder (https://github.com/adobe/dds2atf, file `pvr2atfcore.cpp`, functions `write_dxt1` and `write_dxt5`). That repository is the only authoritative description of the lossy layout.
+Checked against Adobe's encoder (https://github.com/adobe/dds2atf, file `pvr2atfcore.cpp`, functions `write_dxt1` and `write_dxt5`). That repository is the only authoritative description of the lossy layout.
 
 ### Header
 
