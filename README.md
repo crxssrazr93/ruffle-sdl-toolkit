@@ -86,7 +86,6 @@ This section is maintained by hand. Update it when you verify something.
 | Templates: `run-ruffle` and `patchscript` | verified with fakes | tested against fake binaries and tools. shellcheck is clean except pattern warnings in the launcher |
 | PC harness: Xvfb capture and key injection | verified | hooked x86_64 build on the generated fixtures: PNG capture at 640x480 checked visually, `Key.isDown` saw the injected keys |
 | gamescope headless run | verified | |
-| aarch64 binary under qemu | partly verified | only starting and exiting a SWF (qemu taken from Docker) |
 | `--visible=vnc` viewing mode | verified | server starts, listens on localhost only, cleaned up |
 | `--visible=xephyr` and gamescope `--visible` | not verified | Xephyr is not installed here, and checking gamescope visible opens a window |
 | `device.sh` and `keyd.py` | not verified | never run (they need a device and uinput) |
