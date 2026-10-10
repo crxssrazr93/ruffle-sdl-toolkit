@@ -198,6 +198,7 @@ impl Hooks {
             let (Some(verb), Some(key)) = (it.next(), it.next()) else {
                 continue;
             };
+            eprintln!("RUFFLE_SDL_KEYS: {verb} {key}");
             match verb {
                 "down" => out.extend(key_event(key, true)),
                 "up" => out.extend(key_event(key, false)),

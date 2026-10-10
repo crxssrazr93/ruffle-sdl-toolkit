@@ -45,7 +45,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # a free display number, proven by the lock file and the socket, then proven up by xdpyinfo
-for try in 1 2 3 4 5; do
+for _try in 1 2 3 4 5; do
   N=${DNUM:-90}
   while [ -e "/tmp/.X$N-lock" ] || [ -S "/tmp/.X11-unix/X$N" ]; do N=$((N + 1)); done
   Xvfb ":$N" +extension GLX -screen 0 "${W}x${H}x24" -nolisten tcp >"$OUT/xvfb.log" 2>&1 &

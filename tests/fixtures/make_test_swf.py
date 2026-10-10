@@ -2,7 +2,7 @@
 """Generates tiny AVM1 test movies for the ruffle_sdl test harness. Pure python, no deps.
 MIT licensed, created for this toolkit.
 
-  python3 make_test_swf.py [outdir]            writes test_quit.swf, test_relaunch.swf, test_loop.swf
+  python3 make_test_swf.py [outdir]            writes test_quit.swf, test_relaunch.swf, test_loop.swf, test_keys.swf
   python3 make_test_swf.py --check file.swf    lists the tags of a SWF (sanity check)
 
 Every movie is FWS (uncompressed) version 8, 640x480 at 30 fps, 90 frames. Four coloured
@@ -11,7 +11,9 @@ through a colour transform. Frame 1 traces "fixture started". The last frame run
   test_quit.swf      trace, then fscommand("quit")
   test_relaunch.swf  trace, then fscommand("relaunch", "next")  (ruffle_sdl prints the relaunch
                      marker line on stdout and exits)
-  test_loop.swf      nothing, the timeline loops forever (for screenshot and key tests)
+  test_loop.swf      nothing, the timeline loops forever (for screenshot tests)
+  test_keys.swf      like test_loop, and every frame traces "key Left is down" or
+                     "key Space is down" while Key.isDown reports that key (for key injection tests)
 """
 import struct
 import sys
@@ -148,6 +150,19 @@ def a_fscommand(cmd, args=""):
     return b"\x83" + struct.pack("<H", len(d)) + d
 
 
+def a_push_int(v):
+    d = b"\x07" + struct.pack("<i", v)
+    return b"\x96" + struct.pack("<H", len(d)) + d
+
+
+def a_trace_if_key(code, text):
+    """if (Key.isDown(code)) trace(text)"""
+    t = a_trace(text)
+    return (a_push_int(code) + a_push_int(1) + a_push_str("Key") + b"\x1c"
+            + a_push_str("isDown") + b"\x52" + b"\x12"
+            + b"\x9d" + struct.pack("<Hh", 2, len(t)) + t)
+
+
 def do_action(actions):
     return tag(12, actions + b"\x00")
 
@@ -177,6 +192,8 @@ def build(variant):
                 body += place(i + 1, None, (x, y), cx, move=True)
         if f == 0:
             body += do_action(a_trace("fixture started"))
+        if variant == "keys":
+            body += do_action(a_trace_if_key(37, "key Left is down") + a_trace_if_key(32, "key Space is down"))
         if f == FRAMES - 1:
             if variant == "quit":
                 body += do_action(a_trace("fixture quitting") + a_fscommand("quit"))
@@ -217,7 +234,7 @@ def main():
             check(p)
         return
     out = sys.argv[1] if len(sys.argv) > 1 else "."
-    for variant in ("quit", "relaunch", "loop"):
+    for variant in ("quit", "relaunch", "loop", "keys"):
         path = f"{out}/test_{variant}.swf"
         open(path, "wb").write(build(variant))
         check(path)
