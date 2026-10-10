@@ -1,0 +1,504 @@
+From 9ccc0b022d8ae148d3ce1fa415f99a3cf15ab004 Mon Sep 17 00:00:00 2001
+From: Knifethrower <132020881+Knifethrower@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 13:43:15 -0400
+Subject: [PATCH] ruffle_sdl: the software cursor follows the movie
+ (Mouse.hide, hand over buttons)
+
+The software cursor of 0100 showed after every mouse motion, also in games
+that call Mouse.hide() and draw their own pointer, which then showed two.
+The Flash Player's cursor follows the movie, and so does this one now:
+
+* Mouse.hide() hides it, Mouse.show() brings it back (the player tells the
+  UI backend; ruffle_sdl now has one that records this instead of the
+  NullUiBackend)
+* over buttons and links (MouseCursor::Hand and Grab) the built in arrow
+  turns into a pointing hand of the same height, box filtered like the
+  arrow. A custom RUFFLE_SW_CURSOR_IMAGE stays as it is.
+
+RUFFLE_SW_CURSOR_FOLLOW_MOVIE=0 turns this off (the cursor of 0100 as it
+was).
+
+tests/cursor_test.sh (x86_64, Xvfb): the new cases movie_hide,
+movie_hide_ignored and button_hand pass, and so do the original runnable
+cases, the off case still pixel identical to a build without 0100.
+Machinarium on the same PC and on an RG Cube XX (Knulli, KMSDRM, Mali-G31,
+with 0100 and 0101 on the series): the arrow, and the hand over hotspots and
+buttons.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sdl/src/cursor.rs | 327 +++++++++++++++++++++++++++++++++++++++-------
+ sdl/src/main.rs   |   7 +-
+ 2 files changed, 286 insertions(+), 48 deletions(-)
+
+diff --git a/sdl/src/cursor.rs b/sdl/src/cursor.rs
+index 05fdafbb5..0dfc5961a 100644
+--- a/sdl/src/cursor.rs
++++ b/sdl/src/cursor.rs
+@@ -13,11 +13,21 @@
+ //!
+ //! Environment: RUFFLE_SW_CURSOR (0/1, default 0, or the --sw-cursor flag), RUFFLE_SW_CURSOR_IDLE_MS
+ //! (default 2000), RUFFLE_SW_CURSOR_SIZE (pixels, default 24), RUFFLE_SW_CURSOR_IMAGE (PNG path),
+-//! RUFFLE_SDL_CURSOR (0/1, default 0).
++//! RUFFLE_SDL_CURSOR (0/1, default 0), RUFFLE_SW_CURSOR_FOLLOW_MOVIE (0/1, default 1).
++//!
++//! The software cursor follows the movie, as the Flash Player's cursor does: `Mouse.hide()` hides
++//! it (games that draw their own pointer would otherwise show two), `Mouse.show()` brings it back,
++//! and over buttons and links it turns into a hand (the built in arrow only; a custom image stays
++//! as it is). `MovieCursor` collects these requests from the player through the UI backend.
+ //!
+ //! The GL context belongs to wgpu, so every piece of state touched here is saved and restored.
+ 
+ use glow::HasContext;
++use ruffle_core::backend::ui::{
++    DialogResultFuture, FileFilter, FontDefinition, FullscreenError, LanguageIdentifier,
++    MouseCursor, MultiDialogResultFuture, NullUiBackend, UiBackend,
++};
++use ruffle_core::font::FontQuery;
+ use std::cell::{Cell, RefCell};
+ use std::path::Path;
+ use std::rc::Rc;
+@@ -189,6 +199,71 @@ fn arrow(size: u32) -> Bitmap {
+     }
+ }
+ 
++/// The pointing hand of buttons and links, fingertip on the pointer: `X` outline, `.` fill.
++const HAND: [&str; 19] = [
++    "     XX",
++    "    X..X",
++    "    X..X",
++    "    X..X",
++    "    X..X",
++    "    X..XXX",
++    "    X..X..XXX",
++    "    X..X..X..XX",
++    "XXX X..X..X..X.X",
++    "X..XX..........X",
++    "X...X..........X",
++    " X.............X",
++    "  X............X",
++    "  X...........X",
++    "   X..........X",
++    "   X.........X",
++    "    X........X",
++    "    X........X",
++    "    XXXXXXXXXX",
++];
++
++/// `HAND` at `size` pixels high, box filtered (4x4 samples per pixel) so it matches the arrow.
++fn hand(size: u32) -> Bitmap {
++    let (gw, gh) = (16.0f32, HAND.len() as f32);
++    let scale = size as f32 / gh;
++    let width = (gw * scale).ceil() as u32;
++    let n = 4;
++    let mut rgba = vec![0u8; (width * size * 4) as usize];
++    for py in 0..size {
++        for px in 0..width {
++            let (mut white, mut black) = (0u32, 0u32);
++            for sy in 0..n {
++                for sx in 0..n {
++                    let gx = (px as f32 + (sx as f32 + 0.5) / n as f32) / scale;
++                    let gy = (py as f32 + (sy as f32 + 0.5) / n as f32) / scale;
++                    match HAND
++                        .get(gy as usize)
++                        .and_then(|row| row.as_bytes().get(gx as usize))
++                    {
++                        Some(b'X') => black += 1,
++                        Some(b'.') => white += 1,
++                        _ => {}
++                    }
++                }
++            }
++            let covered = white + black;
++            if covered == 0 {
++                continue;
++            }
++            let v = (white * 255 / covered) as u8;
++            let a = (covered * 255 / (n * n)) as u8;
++            let i = ((py * width + px) * 4) as usize;
++            rgba[i..i + 4].copy_from_slice(&[v, v, v, a]);
++        }
++    }
++    Bitmap {
++        width,
++        height: size,
++        rgba,
++        hot: ((5.5 * scale) as i32, 0),
++    }
++}
++
+ /// (is the point inside the polygon (even odd), distance to the polygon's outline)
+ fn poly_probe(poly: &[(f32, f32)], x: f32, y: f32) -> (bool, f32) {
+     let mut inside = false;
+@@ -242,6 +317,7 @@ struct GlObjects {
+     program: glow::Program,
+     vao: glow::VertexArray,
+     texture: glow::Texture,
++    hand_texture: Option<glow::Texture>,
+     u_rect: Option<glow::UniformLocation>,
+     u_screen: Option<glow::UniformLocation>,
+     u_tex: Option<glow::UniformLocation>,
+@@ -259,6 +335,12 @@ pub struct SwCursor {
+     gl: Rc<glow::Context>,
+     idle: Duration,
+     bitmap: Bitmap,
++    /// The hand over buttons (only with the built in arrow)
++    hand: Option<Bitmap>,
++    /// Follow the movie's Mouse.hide()/show() and cursor shape (RUFFLE_SW_CURSOR_FOLLOW_MOVIE)
++    follow_movie: bool,
++    movie_hidden: Cell<bool>,
++    movie_hand: Cell<bool>,
+     pos: Cell<(i32, i32)>,
+     last_motion: Cell<Option<Instant>>,
+     visible: Cell<bool>,
+@@ -276,6 +358,10 @@ impl SwCursor {
+         let idle =
+             Duration::from_millis(env_num("RUFFLE_SW_CURSOR_IDLE_MS").unwrap_or(DEFAULT_IDLE_MS));
+         let bitmap = bitmap();
++        let custom_image =
++            std::env::var_os("RUFFLE_SW_CURSOR_IMAGE").is_some_and(|p| !p.is_empty());
++        let hand = (!custom_image).then(|| hand(bitmap.height));
++        let follow_movie = std::env::var("RUFFLE_SW_CURSOR_FOLLOW_MOVIE").as_deref() != Ok("0");
+         tracing::info!(
+             "software cursor on: {}x{} px, hides after {} ms idle",
+             bitmap.width,
+@@ -286,6 +372,10 @@ impl SwCursor {
+             gl,
+             idle,
+             bitmap,
++            hand,
++            follow_movie,
++            movie_hidden: Cell::new(false),
++            movie_hand: Cell::new(false),
+             pos: Cell::new((0, 0)),
+             last_motion: Cell::new(None),
+             visible: Cell::new(false),
+@@ -302,6 +392,19 @@ impl SwCursor {
+         self.dirty.set(true);
+     }
+ 
++    /// What the movie asked for after a tick: `Mouse.hide()`/`show()` and the hand cursor.
++    pub fn set_movie_state(&self, visible: bool, hand: bool) {
++        if !self.follow_movie {
++            return;
++        }
++        let hand = hand && self.hand.is_some();
++        if self.movie_hidden.get() != !visible || self.movie_hand.get() != hand {
++            self.movie_hidden.set(!visible);
++            self.movie_hand.set(hand);
++            self.dirty.set(self.visible.get());
++        }
++    }
++
+     fn expire(&self) {
+         if self.visible.get()
+             && self
+@@ -335,7 +438,7 @@ impl SwCursor {
+     pub fn draw(&self, screen: (u32, u32)) {
+         self.expire();
+         self.dirty.set(false);
+-        if !self.visible.get() || screen.0 == 0 || screen.1 == 0 {
++        if !self.visible.get() || self.movie_hidden.get() || screen.0 == 0 || screen.1 == 0 {
+             return;
+         }
+         if matches!(*self.objects.borrow(), GlState::Failed) {
+@@ -358,6 +461,10 @@ impl SwCursor {
+             }
+             if let GlState::Ready(o) = &*self.objects.borrow() {
+                 let (x, y) = self.pos.get();
++                let (bitmap, texture) = match (&self.hand, o.hand_texture) {
++                    (Some(hand), Some(texture)) if self.movie_hand.get() => (hand, texture),
++                    _ => (&self.bitmap, o.texture),
++                };
+                 gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+                 gl.viewport(0, 0, screen.0 as i32, screen.1 as i32);
+                 gl.disable(glow::SCISSOR_TEST);
+@@ -377,13 +484,13 @@ impl SwCursor {
+                 gl.bind_vertex_array(Some(o.vao));
+                 gl.active_texture(glow::TEXTURE0);
+                 gl.bind_sampler(0, None);
+-                gl.bind_texture(glow::TEXTURE_2D, Some(o.texture));
++                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                 gl.uniform_4_f32(
+                     o.u_rect.as_ref(),
+-                    (x - self.bitmap.hot.0) as f32,
+-                    (y - self.bitmap.hot.1) as f32,
+-                    self.bitmap.width as f32,
+-                    self.bitmap.height as f32,
++                    (x - bitmap.hot.0) as f32,
++                    (y - bitmap.hot.1) as f32,
++                    bitmap.width as f32,
++                    bitmap.height as f32,
+                 );
+                 gl.uniform_2_f32(o.u_screen.as_ref(), screen.0 as f32, screen.1 as f32);
+                 gl.uniform_1_i32(o.u_tex.as_ref(), 0);
+@@ -423,45 +530,11 @@ impl SwCursor {
+                 return Err(format!("program: {log}"));
+             }
+             let vao = gl.create_vertex_array()?;
+-            let texture = gl.create_texture()?;
+-            gl.active_texture(glow::TEXTURE0);
+-            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+-            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+-            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+-            gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
+-            gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
+-            gl.tex_image_2d(
+-                glow::TEXTURE_2D,
+-                0,
+-                glow::RGBA8 as i32,
+-                self.bitmap.width as i32,
+-                self.bitmap.height as i32,
+-                0,
+-                glow::RGBA,
+-                glow::UNSIGNED_BYTE,
+-                glow::PixelUnpackData::Slice(Some(&self.bitmap.rgba)),
+-            );
+-            gl.tex_parameter_i32(
+-                glow::TEXTURE_2D,
+-                glow::TEXTURE_MIN_FILTER,
+-                glow::LINEAR as i32,
+-            );
+-            gl.tex_parameter_i32(
+-                glow::TEXTURE_2D,
+-                glow::TEXTURE_MAG_FILTER,
+-                glow::LINEAR as i32,
+-            );
+-            gl.tex_parameter_i32(
+-                glow::TEXTURE_2D,
+-                glow::TEXTURE_WRAP_S,
+-                glow::CLAMP_TO_EDGE as i32,
+-            );
+-            gl.tex_parameter_i32(
+-                glow::TEXTURE_2D,
+-                glow::TEXTURE_WRAP_T,
+-                glow::CLAMP_TO_EDGE as i32,
+-            );
++            let texture = upload(gl, &self.bitmap)?;
++            let hand_texture = match &self.hand {
++                Some(hand) => Some(upload(gl, hand)?),
++                None => None,
++            };
+             Ok(GlObjects {
+                 u_rect: gl.get_uniform_location(program, "u_rect"),
+                 u_screen: gl.get_uniform_location(program, "u_screen"),
+@@ -469,11 +542,58 @@ impl SwCursor {
+                 program,
+                 vao,
+                 texture,
++                hand_texture,
+             })
+         }
+     }
+ }
+ 
++/// A texture holding `bitmap` (needs the saved state envelope of `SwCursor::draw`).
++unsafe fn upload(gl: &glow::Context, bitmap: &Bitmap) -> Result<glow::Texture, String> {
++    unsafe {
++        let texture = gl.create_texture()?;
++        gl.active_texture(glow::TEXTURE0);
++        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
++        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
++        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
++        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
++        gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
++        gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
++        gl.tex_image_2d(
++            glow::TEXTURE_2D,
++            0,
++            glow::RGBA8 as i32,
++            bitmap.width as i32,
++            bitmap.height as i32,
++            0,
++            glow::RGBA,
++            glow::UNSIGNED_BYTE,
++            glow::PixelUnpackData::Slice(Some(&bitmap.rgba)),
++        );
++        gl.tex_parameter_i32(
++            glow::TEXTURE_2D,
++            glow::TEXTURE_MIN_FILTER,
++            glow::LINEAR as i32,
++        );
++        gl.tex_parameter_i32(
++            glow::TEXTURE_2D,
++            glow::TEXTURE_MAG_FILTER,
++            glow::LINEAR as i32,
++        );
++        gl.tex_parameter_i32(
++            glow::TEXTURE_2D,
++            glow::TEXTURE_WRAP_S,
++            glow::CLAMP_TO_EDGE as i32,
++        );
++        gl.tex_parameter_i32(
++            glow::TEXTURE_2D,
++            glow::TEXTURE_WRAP_T,
++            glow::CLAMP_TO_EDGE as i32,
++        );
++        Ok(texture)
++    }
++}
++
+ const VERT: &str = "#version 300 es
+ uniform vec4 u_rect;
+ uniform vec2 u_screen;
+@@ -598,3 +718,118 @@ impl Saved {
+         }
+     }
+ }
++
++/// What the movie asked of the cursor: `Mouse.hide()`/`show()` and the hand over buttons.
++#[derive(Clone)]
++pub struct MovieCursor {
++    pub visible: Rc<Cell<bool>>,
++    pub hand: Rc<Cell<bool>>,
++}
++
++impl MovieCursor {
++    pub fn new() -> Self {
++        Self {
++            visible: Rc::new(Cell::new(true)),
++            hand: Rc::new(Cell::new(false)),
++        }
++    }
++}
++
++/// `NullUiBackend` that records the cursor requests into a `MovieCursor`.
++pub struct SdlUi {
++    cursor: MovieCursor,
++    null: NullUiBackend,
++}
++
++impl SdlUi {
++    pub fn new(cursor: MovieCursor) -> Self {
++        Self {
++            cursor,
++            null: NullUiBackend::new(),
++        }
++    }
++}
++
++impl UiBackend for SdlUi {
++    fn mouse_visible(&self) -> bool {
++        self.cursor.visible.get()
++    }
++
++    fn set_mouse_visible(&mut self, visible: bool) {
++        self.cursor.visible.set(visible);
++    }
++
++    fn set_mouse_cursor(&mut self, cursor: MouseCursor) {
++        self.cursor
++            .hand
++            .set(matches!(cursor, MouseCursor::Hand | MouseCursor::Grab));
++    }
++
++    fn clipboard_content(&mut self) -> String {
++        self.null.clipboard_content()
++    }
++
++    fn set_clipboard_content(&mut self, content: String) {
++        self.null.set_clipboard_content(content)
++    }
++
++    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError> {
++        self.null.set_fullscreen(is_full)
++    }
++
++    fn display_root_movie_download_failed_message(&self, invalid_swf: bool, fetch_error: String) {
++        self.null
++            .display_root_movie_download_failed_message(invalid_swf, fetch_error)
++    }
++
++    fn message(&self, message: &str) {
++        self.null.message(message)
++    }
++
++    fn open_virtual_keyboard(&self) {}
++
++    fn close_virtual_keyboard(&self) {}
++
++    fn language(&self) -> LanguageIdentifier {
++        self.null.language()
++    }
++
++    fn display_unsupported_video(&self, url: url::Url) {
++        self.null.display_unsupported_video(url)
++    }
++
++    fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
++        self.null.load_device_font(query, register)
++    }
++
++    fn sort_device_fonts(
++        &self,
++        query: &FontQuery,
++        register: &mut dyn FnMut(FontDefinition),
++    ) -> Vec<FontQuery> {
++        self.null.sort_device_fonts(query, register)
++    }
++
++    fn display_file_open_dialog(&mut self, filters: Vec<FileFilter>) -> Option<DialogResultFuture> {
++        self.null.display_file_open_dialog(filters)
++    }
++
++    fn display_file_open_dialog_multiple(
++        &mut self,
++        filters: Vec<FileFilter>,
++    ) -> Option<MultiDialogResultFuture> {
++        self.null.display_file_open_dialog_multiple(filters)
++    }
++
++    fn display_file_save_dialog(
++        &mut self,
++        file_name: String,
++        title: String,
++    ) -> Option<DialogResultFuture> {
++        self.null.display_file_save_dialog(file_name, title)
++    }
++
++    fn close_file_dialog(&mut self) {
++        self.null.close_file_dialog()
++    }
++}
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index a206b9434..ecf3a1997 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -14,7 +14,6 @@ use clap::Parser;
+ use glow::HasContext;
+ use ruffle_core::backend::audio::NullAudioBackend;
+ use ruffle_core::backend::navigator::{NullExecutor, NullNavigatorBackend};
+-use ruffle_core::backend::ui::NullUiBackend;
+ use ruffle_core::config::Letterbox;
+ use ruffle_core::events::{MouseButton, MouseWheelDelta, PlayerEvent};
+ use ruffle_core::external::FsCommandProvider;
+@@ -409,13 +408,14 @@ fn main() -> anyhow::Result<()> {
+         WgpuRenderBackend::new(descriptors, target).map_err(|e| anyhow!(e.to_string()))?;
+ 
+     let quit = Rc::new(Cell::new(false));
++    let movie_cursor = cursor::MovieCursor::new();
+     let mut builder = PlayerBuilder::new()
+         .with_renderer(renderer)
+         .with_storage(Box::new(DiskStorageBackend::new(
+             opt.save_directory.clone(),
+         )))
+         .with_video(ruffle_video_software::backend::SoftwareVideoBackend::new())
+-        .with_ui(NullUiBackend::new())
++        .with_ui(cursor::SdlUi::new(movie_cursor.clone()))
+         .with_navigator(navigator)
+         .with_fs_commands(Box::new(FsCommands { quit: quit.clone() }))
+         .with_player_runtime(opt.player_runtime)
+@@ -665,6 +665,9 @@ fn main() -> anyhow::Result<()> {
+             }
+             next_frame = now + player.time_til_next_frame();
+             timing.0 += t1 - t0;
++            if let Some(cursor) = &sw_cursor {
++                cursor.set_movie_state(movie_cursor.visible.get(), movie_cursor.hand.get());
++            }
+             if player.needs_render() || sw_cursor.as_ref().is_some_and(|c| c.wants_redraw()) {
+                 player.render();
+                 drop(player);
+-- 
+2.43.0
+

@@ -14,6 +14,7 @@ may need them regenerated.
 | Number | Title | Author | Environment variables (default) | Flag |
 | --- | --- | --- | --- | --- |
 | 0100 | ruffle_sdl: software mouse cursor overlay and SDL colour cursor | crxssrazr93 | `RUFFLE_SW_CURSOR` (0), `RUFFLE_SW_CURSOR_IDLE_MS` (2000), `RUFFLE_SW_CURSOR_SIZE` (24), `RUFFLE_SW_CURSOR_IMAGE` (unset, built in arrow), `RUFFLE_SDL_CURSOR` (0) | `--sw-cursor` |
+| 0101 | ruffle_sdl: the software cursor follows the movie (Mouse.hide, hand over buttons). Needs 0100: `WITH_OPTIONAL="0100 0101"` | Knifethrower | `RUFFLE_SW_CURSOR_FOLLOW_MOVIE` (1, 0 off) | none |
 
 ## 0100 software cursor
 
@@ -41,3 +42,21 @@ and a few anchored hooks in `sdl/src/main.rs`, and one `png` dependency line in 
 Test it headless with `tests/cursor_test.sh`, see `docs/09-input.md` and `tests/README.md`. The test
 hooks of `tests/sdl_test_hooks.py` apply on top of this patch (the capture sees the cursor, because it
 is drawn inside the blit, before the capture point).
+
+## 0101 the cursor follows the movie
+
+On top of 0100. The Flash Player's cursor follows the movie, and with this patch the software cursor
+does too:
+
+* `Mouse.hide()` hides it and `Mouse.show()` brings it back. Games that draw their own pointer call
+  `Mouse.hide()`; with 0100 alone they show two pointers.
+* Over buttons and links (the player's hand cursor, `MouseCursor::Hand` and `Grab`) the built in
+  arrow turns into a pointing hand of the same height, made the same way (box filtered, white with
+  a black outline, fingertip on the pointer). A `RUFFLE_SW_CURSOR_IMAGE` stays as it is.
+
+`ruffle_sdl` gets a small UI backend that records these two requests instead of the
+`NullUiBackend`; everything else is passed to the null backend. `RUFFLE_SW_CURSOR_FOLLOW_MOVIE=0`
+gives the cursor of 0100 unchanged. The SDL colour cursor (`RUFFLE_SDL_CURSOR`) does not follow.
+
+Test: `tests/cursor_test.sh` cases `movie_hide`, `movie_hide_ignored` and `button_hand`, with the
+fixtures `test_hide.swf` (calls `Mouse.hide()`) and `test_button.swf` (a button under the pointer).

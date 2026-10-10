@@ -12,7 +12,7 @@ Truthiness is not uniform, and the difference causes real mistakes. There are th
 |-|-|-|
 | Set means on (`var_os().is_some()`) | `RUFFLE_FPS_LOG`, `RUFFLE_AS3_PROF`, `RUFFLE_SDL_TIMING`, `PM_GPUSTAT` | Any value, including `0` and an empty string, turns it on. Unset it to turn it off. |
 | Opt in, not empty and not `0` | `RUFFLE_LAZY_MOUSE_PICK`, `RUFFLE_FRAMESKIP`, `RUFFLE_MEMLOG` | Off when unset, empty or `0`. (One extra `RUFFLE_MEMLOG` log line, the SWF size line, is gated on the variable merely being set.) |
-| Default on, `0` disables | `RUFFLE_LAZY_SHAPES`, `RUFFLE_LAZY_SHAPE_RECORDS`, `RUFFLE_DRAW_IN_PLACE`, `RUFFLE_ZEROED_PIXELS`, `RUFFLE_EMPTY_TEXTURES`, `RUFFLE_S3D_DEFER_UPLOAD`, `RUFFLE_S3D_MERGE_PASSES`, `RUFFLE_FREE_LOADED_MOVIES` | On unless the value is exactly `0`. |
+| Default on, `0` disables | `RUFFLE_LAZY_SHAPES`, `RUFFLE_LAZY_SHAPE_RECORDS`, `RUFFLE_DRAW_IN_PLACE`, `RUFFLE_ZEROED_PIXELS`, `RUFFLE_EMPTY_TEXTURES`, `RUFFLE_S3D_DEFER_UPLOAD`, `RUFFLE_S3D_MERGE_PASSES`, `RUFFLE_FREE_LOADED_MOVIES`, `RUFFLE_SW_CURSOR_FOLLOW_MOVIE` | On unless the value is exactly `0`. |
 | Numeric with default | `RUFFLE_GC_STEP`, `RUFFLE_TRIM_SECS`, `RUFFLE_GC_LONG_TICK`, `RUFFLE_DRAW_POOL_MB`, `RUFFLE_MIN_KEY_HOLD_MS`, `RUFFLE_MEMLOG_MS`, `RUFFLE_MEMLOG_TOP` | An unparsable value silently falls back to the default. `0` turns the feature off where the table says so. |
 
 Values are read once at first use and cached for the life of the process. Change them before launching.
@@ -108,6 +108,7 @@ Not in the default series. These variables exist only when `ruffle/optional/0100
 | `RUFFLE_SW_CURSOR_IDLE_MS` | `2000` | Hide the cursor after this many ms without motion. | Shorter for less distraction. | optional patch 0100 | C |
 | `RUFFLE_SW_CURSOR_SIZE` | `24` | Height of the built in arrow in pixels (8 to 256). For a PNG image: unset keeps the image size, set scales it to this height. | Bigger on high resolution screens. | optional patch 0100 | C |
 | `RUFFLE_SW_CURSOR_IMAGE` | unset (built in arrow) | Path to a PNG used as the cursor image (up to 512 by 512, hotspot at the top left pixel). A file that fails to load falls back to the arrow with a warning. | Custom look. | optional patch 0100 | C |
+| `RUFFLE_SW_CURSOR_FOLLOW_MOVIE` | on | The software cursor follows the movie: `Mouse.hide()`/`show()`, a hand over buttons (built in arrow only). `0` ignores the movie. | `0` if a game hides the pointer but should show it on a handheld. | optional patch 0101 | K |
 | `RUFFLE_SDL_CURSOR` | `0` | `1` builds an SDL colour cursor (`SDL_CreateColorCursor`) from the same bitmap and shows it. Works only where the video driver draws cursors (X11, Wayland), not on fbdev or KMSDRM without a hardware cursor. | Drivers that show an SDL cursor. | optional patch 0100 | C |
 
 ### Experiments that are not shipped

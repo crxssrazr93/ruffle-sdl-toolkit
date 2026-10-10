@@ -122,6 +122,7 @@ A small arrow drawn by `ruffle_sdl` as one GLES 3.0 quad after the movie is blit
 
 * Patch: `ruffle/optional/0100-ruffle_sdl-software-cursor-overlay.patch` (applied with `WITH_OPTIONAL="0100" ruffle/fetch.sh`).
 * Switches: `RUFFLE_SW_CURSOR` (default 0, 1 enables), `RUFFLE_SW_CURSOR_IDLE_MS` (default 2000), `RUFFLE_SW_CURSOR_SIZE` (pixels, default 24), `RUFFLE_SW_CURSOR_IMAGE` (optional PNG path), and the `--sw-cursor` CLI flag.
+* Optional patch 0101 on top (`WITH_OPTIONAL="0100 0101"`) makes it follow the movie like the Flash Player's cursor: `Mouse.hide()` hides it (games that draw their own pointer showed two before), `Mouse.show()` brings it back, and over buttons and links the arrow becomes a pointing hand. `RUFFLE_SW_CURSOR_FOLLOW_MOVIE=0` turns that off. Verified headless by the `cursor_test.sh` cases `movie_hide`, `movie_hide_ignored` and `button_hand`, and in Machinarium on the PC and on an RG Cube XX (Knulli, KMSDRM, Mali-G31): the arrow of 0100 and the hand over the hint book's close button, hidden after the idle time, no GL error in the log. That run is also the first of 0100 on a handheld.
 * Works for every movie, needs no shell patch, not tied to the AVM version.
 
 How to use:

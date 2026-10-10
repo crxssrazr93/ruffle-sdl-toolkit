@@ -32,7 +32,7 @@ ruffle/build-x86_64.sh work/ruffle-src work/out-pc
 
 ## The patches
 
-Credit: patches 0001 to 0004 and 0013 are by crxssrazr93. The `ruffle_sdl` front end (0006) and the memory patches 0005 and 0007 to 0012 are by Knifethrower (contributed as GitHub PR #1 on the example port repo), and carry the author line `port <port@localhost>` from the original export. Do not rewrite those author lines. Patch 0014 is by Knifethrower, with that author line.
+Credit: patches 0001 to 0004 and 0013 are by crxssrazr93. The `ruffle_sdl` front end (0006) and the memory patches 0005 and 0007 to 0012 are by Knifethrower (contributed as GitHub PR #1 on the example port repo), and carry the author line `port <port@localhost>` from the original export. Do not rewrite those author lines. Patch 0014 and optional patch 0101 are by Knifethrower, with that author line.
 
 Env vars are read at run time. "Generic" means the patch has no game specific behaviour.
 

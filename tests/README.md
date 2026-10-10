@@ -114,8 +114,12 @@ pointer, and the capture after the idle time must be identical to the first. Cas
 the `--sw-cursor` flag with `--render-size` and `RUFFLE_SW_CURSOR_SIZE`, a PNG image (exactly 64
 magenta pixels for an 8 by 8 image), switched off (identical to before, and to `PLAIN_BIN` when
 given), the animated movie (the animation keeps running, no GL error), the SDL colour cursor
-switch (creation only, the video driver draws that cursor, not the GL frame), and the AS2 and AS3
-overlay snippets compiled with ffdec (skipped when `FFDEC` or `RUFFLE_SRC` is missing). The exit
+switch (creation only, the video driver draws that cursor, not the GL frame), the AS2 and AS3
+overlay snippets compiled with ffdec (skipped when `FFDEC` or `RUFFLE_SRC` is missing), and for
+optional patch 0101: a movie that calls `Mouse.hide()` (no cursor pixels after motion), the same
+with `RUFFLE_SW_CURSOR_FOLLOW_MOVIE=0` (the arrow), and a button under the pointer (a hand with
+the fingertip on the pointer, wider than the arrow). The 0101 cases need `test_hide.swf` and
+`test_button.swf` and fail on a build without 0101. The exit
 code is non zero if any case fails, and failed cases keep their captures in the output folder.
 
 ## gamescope_headless.sh

@@ -11,8 +11,10 @@ third party content.
 | `test_loop.swf` | nothing, the timeline loops | screenshot tests, stopped by the harness |
 | `test_keys.swf` | like `test_loop.swf`, and every frame traces `key Left is down` or `key Space is down` while `Key.isDown` reports that key | key injection tests (`RUFFLE_SDL_KEYS`, `keyd.py`) |
 | `test_static.swf` | one frame with the same shapes and a `stop()`, nothing ever changes | pixel exact comparisons (`tests/cursor_test.sh`) |
+| `test_hide.swf` | like `test_static.swf`, and frame 1 calls `Mouse.hide()` | the software cursor follows the movie (`cursor_test.sh`, optional patch 0101) |
+| `test_button.swf` | like `test_static.swf`, plus a 120x80 button at (240,380) without actions, so the player shows the hand cursor over it | the hand cursor (`cursor_test.sh`, optional patch 0101) |
 
-All of them are uncompressed (`FWS`) version 8 AVM1 movies, 640x480 at 30 fps, 90 frames (`test_static.swf`: 1 frame, the rest 3 seconds
+All of them are uncompressed (`FWS`) version 8 AVM1 movies, 640x480 at 30 fps, 90 frames (`test_static.swf`, `test_hide.swf`, `test_button.swf`: 1 frame, the rest 3 seconds
 per loop). Four coloured rectangles (DefineShape plus PlaceObject2 with a move on every frame)
 sweep across a dark background and the first one flashes through a colour transform, so two
 screenshots taken at different times differ. Frame 1 traces `fixture started`, which shows up in

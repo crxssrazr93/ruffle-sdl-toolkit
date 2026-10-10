@@ -120,6 +120,27 @@ if mode == "cursor":
         print(f"  white pixels {white}, black pixels {black}")
         check(white >= 10 and black >= 5, "white fill and black outline both present")
     check(len(d2) == 0, "pixel identical to the first capture after the idle time (cursor gone)")
+elif mode == "hand":
+    # hand <before> <during> <after> <x> <y>: a pointing hand, fingertip on the pointer, wider than
+    # the arrow of the same height (24 px: arrow 16 px wide, hand about 20)
+    before, during, after = (load(p) for p in sys.argv[2:5])
+    x, y = (int(v) for v in sys.argv[5:7])
+    d1 = diff(before, during)
+    d2 = diff(before, after)
+    print(f"  pixels changed by the cursor: {len(d1)}; after idle: {len(d2)}")
+    check(len(d1) >= 80, f"cursor pixels present after motion ({len(d1)} >= 80)")
+    if d1:
+        x0, y0, x1, y1 = bbox(d1)
+        print(f"  cursor bounding box: ({x0},{y0})..({x1},{y1}) = {x1 - x0 + 1}x{y1 - y0 + 1}")
+        check(abs(y0 - y) <= 2, f"fingertip at the pointer's height {y} +-2")
+        check(x - 9 <= x0 <= x - 4, f"fingertip column on the pointer (left edge {x0} in {x - 9}..{x - 4})")
+        check(x1 - x0 + 1 >= 19, f"wider than the arrow ({x1 - x0 + 1} >= 19 px)")
+        px = during[2]
+        white = sum(1 for (cx, cy) in d1 if min(px[cy][cx]) >= 235)
+        black = sum(1 for (cx, cy) in d1 if max(px[cy][cx]) <= 30)
+        print(f"  white pixels {white}, black pixels {black}")
+        check(white >= 10 and black >= 5, "white fill and black outline both present")
+    check(len(d2) == 0, "pixel identical to the first capture after the idle time (cursor gone)")
 elif mode == "same":
     a, b = load(sys.argv[2]), load(sys.argv[3])
     d = diff(a, b)
@@ -182,6 +203,7 @@ run_case() {
   CASE_DIR="$OUT/$name"; rm -rf "$CASE_DIR"; mkdir -p "$CASE_DIR"
   echo "== $name: $(basename "$swf") ${envs[*]:-} ${extra[*]:-}"
   env -u RUFFLE_SW_CURSOR -u RUFFLE_SW_CURSOR_IDLE_MS -u RUFFLE_SW_CURSOR_SIZE -u RUFFLE_SW_CURSOR_IMAGE -u RUFFLE_SDL_CURSOR \
+      -u RUFFLE_SW_CURSOR_FOLLOW_MOVIE \
       CT_REAL="$BIN" CT_OUT="$CASE_DIR" CT_X=$PX CT_Y=$PY CT_DELAY="$delay" CT_HOST_DISPLAY="$HOST_DISPLAY" \
       SHOT_AT="$shot_at" EXIT_AFTER_SHOTS=1 "${envs[@]}" \
       "$RUN" --headless "$OUT/wrap.sh" "$swf" "$CASE_DIR" 20 "${extra[@]}" >"$CASE_DIR/harness.log" 2>&1
@@ -305,6 +327,28 @@ if [ "$ffdec_ok" -eq 1 ] && [ -f "$snip3" ] && [ -f "$base3" ]; then
   else echo "  FAIL ffdec produced no SWF, see $OUT/ffdec3.log"; end_case 1; fi
 else
   echo "== as3_overlay: SKIPPED (needs FFDEC and RUFFLE_SRC pointing at a Ruffle source tree)"; CASES=$((CASES - 1))
+fi
+
+# 9. the movie hides the cursor (Mouse.hide() on frame 1, optional patch 0101): motion draws nothing
+HIDE="$FIX/test_hide.swf"; BUTTON="$FIX/test_button.swf"
+if [ -f "$HIDE" ] && [ -f "$BUTTON" ]; then
+  begin
+  run_case movie_hide "$HIDE" "$SHOTS" 0.3 RUFFLE_SW_CURSOR=1 RUFFLE_SW_CURSOR_IDLE_MS=$IDLE
+  r=0
+  if shots; then an same "$S1" "$S2" || r=1; an same "$S1" "$S3" || r=1; else echo "  FAIL missing captures"; r=1; fi
+  end_case $r
+
+  # 10. the same movie with RUFFLE_SW_CURSOR_FOLLOW_MOVIE=0: the arrow of 0100 as before
+  begin
+  run_case movie_hide_ignored "$HIDE" "$SHOTS" 0.3 RUFFLE_SW_CURSOR=1 RUFFLE_SW_CURSOR_IDLE_MS=$IDLE RUFFLE_SW_CURSOR_FOLLOW_MOVIE=0
+  if shots; then an cursor "$S1" "$S2" "$S3" $PX $PY 60 18 26 21; end_case $?; else echo "  FAIL missing captures"; end_case 1; fi
+
+  # 11. over a button the arrow turns into the hand (fingertip on the pointer, wider than the arrow)
+  begin
+  run_case button_hand "$BUTTON" "$SHOTS" 0.3 RUFFLE_SW_CURSOR=1 RUFFLE_SW_CURSOR_IDLE_MS=$IDLE
+  if shots; then an hand "$S1" "$S2" "$S3" $PX $PY; end_case $?; else echo "  FAIL missing captures"; end_case 1; fi
+else
+  echo "== movie_hide, movie_hide_ignored, button_hand: SKIPPED (fixtures missing, run fixtures/make_test_swf.py)"
 fi
 
 echo

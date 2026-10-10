@@ -75,7 +75,7 @@ This section is maintained by hand. Update it when you verify something.
 
 | Area | Status | Notes |
 |-|-|-|
-| Patch series 0001 to 0014 applies to the pinned commit | verified | `ruffle/fetch.sh` applies it cleanly on the pinned commit |
+| Patch series 0001 to 0014 applies to the pinned commit | verified | `ruffle/fetch.sh` applies it cleanly on the pinned commit, also with `WITH_OPTIONAL="0100 0101"` |
 | Freeing AVM1 loaded movies (0014) | verified on PC and one handheld | Machinarium hint book loop on PC (262 -> 265 MB, 297 -> 347 MB with the switch off) and on an RG Cube XX (276 to 298 MB over the 20 cycles, no trend); Ruffle regression groups avm1, avm2, import_assets, fonts, mixed_avm pass with and without it (1962 tests); Fancy Pants World 2 L1 and World 3 L4 unchanged on PC. AVM2 `Loader` content is still not freed, see docs/05-memory.md |
 | x86_64 `ruffle_sdl` build from the series | verified | release build, about 3.5 minutes |
 | aarch64 build (Docker) and glibc floor | verified | `ruffle/build-aarch64.sh` built `ruffle_sdl` from the 0001 to 0013 series: 16.7 MB, max GLIBC_2.30, needs libSDL2, libasound, libdl, libgcc_s, libpthread, libm, libc. The script fails above `MAX_GLIBC` (default 2.30). `atftool` also built for aarch64 (652 KB, glibc 2.30) |
@@ -90,6 +90,7 @@ This section is maintained by hand. Update it when you verify something.
 | `--visible=xephyr` and gamescope `--visible` | not verified | Xephyr is not installed here, and checking gamescope visible opens a window |
 | `device.sh` and `keyd.py` | not verified | never run (they need a device and uinput) |
 | Software cursor, front end overlay (optional patch 0100) | verified headless | 8 of 8 pixel cases in `tests/cursor_test.sh` on x86_64 Xvfb: arrow appears under the pointer after motion, disappears after the idle time, works with `--render-size`, a PNG image and an animated movie, and is pixel identical to an unpatched build when off. Not run on a real GPU, Mali, KMSDRM or SDL 2.0.10 |
+| Software cursor follows the movie (optional patch 0101) | verified headless | `tests/cursor_test.sh` cases movie_hide, movie_hide_ignored and button_hand pass (9 of 9 runnable cases with the original ones, the off case still pixel identical to a build without 0100); Machinarium on PC and on an RG Cube XX (Knulli, KMSDRM, Mali-G31): the arrow, the hand over hotspots, hidden after the idle time |
 | Software cursor, SDL colour cursor | creation only | The cursor is built; being drawn by the video driver it cannot appear in the GL capture, so visibility is unverified |
 | Software cursor, shell side AS2 and AS3 overlays | verified headless | Snippets compiled by ffdec into small movies and checked by the same pixel test. Not tried in a real game shell |
 | Software cursor, gptokeyb pointer source | documented only | Pairs with any of the above, see docs/09-input.md |
