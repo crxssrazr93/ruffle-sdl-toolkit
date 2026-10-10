@@ -10,8 +10,9 @@ third party content.
 | `test_relaunch.swf` | traces `fixture relaunching`, then `fscommand("relaunch", "next")` | the player must print the relaunch marker line (`RUFFLE_RELAUNCH next`) on stdout and exit |
 | `test_loop.swf` | nothing, the timeline loops | screenshot tests, stopped by the harness |
 | `test_keys.swf` | like `test_loop.swf`, and every frame traces `key Left is down` or `key Space is down` while `Key.isDown` reports that key | key injection tests (`RUFFLE_SDL_KEYS`, `keyd.py`) |
+| `test_static.swf` | one frame with the same shapes and a `stop()`, nothing ever changes | pixel exact comparisons (`tests/cursor_test.sh`) |
 
-All four are uncompressed (`FWS`) version 8 AVM1 movies, 640x480 at 30 fps, 90 frames (3 seconds
+All of them are uncompressed (`FWS`) version 8 AVM1 movies, 640x480 at 30 fps, 90 frames (`test_static.swf`: 1 frame, the rest 3 seconds
 per loop). Four coloured rectangles (DefineShape plus PlaceObject2 with a move on every frame)
 sweep across a dark background and the first one flashes through a colour transform, so two
 screenshots taken at different times differ. Frame 1 traces `fixture started`, which shows up in

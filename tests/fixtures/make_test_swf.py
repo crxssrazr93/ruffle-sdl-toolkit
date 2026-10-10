@@ -2,7 +2,7 @@
 """Generates tiny AVM1 test movies for the ruffle_sdl test harness. Pure python, no deps.
 MIT licensed, created for this toolkit.
 
-  python3 make_test_swf.py [outdir]            writes test_quit.swf, test_relaunch.swf, test_loop.swf, test_keys.swf
+  python3 make_test_swf.py [outdir]            writes test_quit.swf, test_relaunch.swf, test_loop.swf, test_keys.swf, test_static.swf
   python3 make_test_swf.py --check file.swf    lists the tags of a SWF (sanity check)
 
 Every movie is FWS (uncompressed) version 8, 640x480 at 30 fps, 90 frames. Four coloured
@@ -12,6 +12,7 @@ through a colour transform. Frame 1 traces "fixture started". The last frame run
   test_relaunch.swf  trace, then fscommand("relaunch", "next")  (ruffle_sdl prints the relaunch
                      marker line on stdout and exits)
   test_loop.swf      nothing, the timeline loops forever (for screenshot tests)
+  test_static.swf    one frame, stop(), nothing ever changes (pixel exact comparisons)
   test_keys.swf      like test_loop, and every frame traces "key Left is down" or
                      "key Space is down" while Key.isDown reports that key (for key injection tests)
 """
@@ -176,11 +177,12 @@ SHAPES = [  # id, w, h, colour
 
 
 def build(variant):
-    body = rect(0, W * 20, 0, H * 20) + struct.pack("<HH", FPS << 8, FRAMES)
+    frames = 1 if variant == "static" else FRAMES
+    body = rect(0, W * 20, 0, H * 20) + struct.pack("<HH", FPS << 8, frames)
     body += tag(9, bytes([24, 24, 40]))  # background
     for cid, w, h, rgb in SHAPES:
         body += define_shape(cid, w, h, rgb)
-    for f in range(FRAMES):
+    for f in range(frames):
         for i, (cid, w, h, _) in enumerate(SHAPES):
             # each rectangle sweeps on its own track, positions change every frame
             x = 20 + ((f * (4 + i * 3) + i * 150) % (W - w - 40))
@@ -192,6 +194,8 @@ def build(variant):
                 body += place(i + 1, None, (x, y), cx, move=True)
         if f == 0:
             body += do_action(a_trace("fixture started"))
+        if variant == "static":
+            body += do_action(b"\x07")  # ActionStop: one frame, nothing ever changes
         if variant == "keys":
             body += do_action(a_trace_if_key(37, "key Left is down") + a_trace_if_key(32, "key Space is down"))
         if f == FRAMES - 1:
@@ -234,7 +238,7 @@ def main():
             check(p)
         return
     out = sys.argv[1] if len(sys.argv) > 1 else "."
-    for variant in ("quit", "relaunch", "loop", "keys"):
+    for variant in ("quit", "relaunch", "loop", "keys", "static"):
         path = f"{out}/test_{variant}.swf"
         open(path, "wb").write(build(variant))
         check(path)

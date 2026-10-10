@@ -1,0 +1,74 @@
+// Software cursor overlay (AS1/AS2 shell)
+//
+// Status: tested headless. Compiled from this source into a one frame AVM1 movie with ffdec and
+// run in ruffle_sdl on Xvfb by tests/cursor_test.sh: the arrow appears under a pointer moved with
+// xdotool, and is gone again after the idle time (pixel comparison). Not tried on a device.
+//
+// Why: ruffle_sdl hides the system cursor, so a pointer driven by a gamepad (gptokeyb right stick
+// mouse) cannot be seen. This draws a small arrow movie clip on top of everything, moves it with
+// the mouse, shows it after mouse motion and hides it again after an idle time. It needs no
+// front end patch. The other options are the front end overlay (optional patch 0100) and the
+// SDL colour cursor, see docs/09-input.md.
+//
+// Put it in a frame script that runs once (the first frame of the root timeline, or the shell's
+// init code). The guard makes a looping timeline safe.
+//
+// Mouse.hide() is still called: on a desktop Flash player it hides the real cursor, in
+// ruffle_sdl the system cursor is already hidden.
+
+if (_root.__cursorOverlay == undefined) {
+    var cursorIdleMs:Number = 2000;      // hide after this long without motion
+    var cursorLastMove:Number = 0;
+
+    Mouse.hide();
+
+    // depth: far above anything a game uses (AS2 allows up to 2130690045)
+    var cursorClip:MovieClip = _root.createEmptyMovieClip("__cursorOverlay", 2000000);
+    cursorClip.lineStyle(1, 0x000000, 100);
+    cursorClip.beginFill(0xFFFFFF, 100);
+    cursorClip.moveTo(0, 0);
+    cursorClip.lineTo(0, 17);
+    cursorClip.lineTo(4, 13);
+    cursorClip.lineTo(7, 20);
+    cursorClip.lineTo(10, 19);
+    cursorClip.lineTo(7, 12);
+    cursorClip.lineTo(12, 12);
+    cursorClip.lineTo(0, 0);
+    cursorClip.endFill();
+    cursorClip._visible = false;
+    cursorClip.enabled = false;          // not a button, never takes mouse events
+
+    var cursorListener:Object = new Object();
+    cursorListener.onMouseMove = function () {
+        cursorClip._x = _root._xmouse;
+        cursorClip._y = _root._ymouse;
+        cursorClip._visible = true;
+        cursorLastMove = getTimer();
+    };
+    Mouse.addListener(cursorListener);
+
+    // every frame: follow the pointer while shown, hide after idle. Following here as well is
+    // not optional in Ruffle: inside onMouseMove _xmouse and _ymouse still hold the position of
+    // the PREVIOUS event, so the arrow would lag one event behind (Flash Player gives the new one)
+    cursorClip.onEnterFrame = function () {
+        if (this._visible) {
+            this._x = _root._xmouse;
+            this._y = _root._ymouse;
+            if ((getTimer() - cursorLastMove) > cursorIdleMs) {
+                this._visible = false;
+            }
+        }
+    };
+}
+
+// Notes
+//  * If the game keeps its own depth numbers high or uses swapDepths, pick a larger depth or
+//    call cursorClip.swapDepths(_root.getNextHighestDepth()) after a menu opens.
+//  * If the shell scales _root (a stage resize handler), the arrow scales with it. Set
+//    cursorClip._xscale and _yscale to 10000 / _root._xscale and 10000 / _root._yscale to
+//    keep it constant.
+//  * AS2 SWFs are normally patched as P-code. Either paste this as source (ffdec compiles AS1/2
+//    source for small scripts) or export the frame's P-code with ffdec.sh pcode, and copy the
+//    shape of the calls from there, see tools/swf/README.md.
+//  * A mouse listener only fires while the movie has mouse focus, which is always the case in
+//    ruffle_sdl.

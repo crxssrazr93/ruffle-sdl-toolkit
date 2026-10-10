@@ -1,0 +1,758 @@
+From 1f2550fccc975d4da3fbd240eaa9b2b91485b3b1 Mon Sep 17 00:00:00 2001
+From: crxssrazr93 <crxssrazr93@gmail.com>
+Date: Sat, 10 Oct 2026 21:49:06 +0530
+Subject: [PATCH] ruffle_sdl: software mouse cursor overlay and SDL colour
+ cursor
+
+ruffle_sdl hides the OS cursor, so a gamepad driven mouse (gptokeyb right stick
+mouse, a uinput mouse) is invisible. Add two optional remedies.
+
+Software cursor (RUFFLE_SW_CURSOR=1 or --sw-cursor): a small arrow drawn as one
+GLES 3.0 quad on the window framebuffer after the movie blit and before the
+buffer swap, in window pixels (works with --render-size and letterboxing).
+Shown after SDL MouseMotion, hidden after RUFFLE_SW_CURSOR_IDLE_MS (default 2000)
+without motion, zero work while hidden. Every GL state item touched is saved and
+restored, since wgpu owns the context. RUFFLE_SW_CURSOR_SIZE (default 24 px) sets
+the height, RUFFLE_SW_CURSOR_IMAGE loads a PNG instead of the built in arrow.
+The frame is redrawn when only the cursor changed.
+
+SDL colour cursor (RUFFLE_SDL_CURSOR=1): SDL_CreateColorCursor from the same
+bitmap and shows the SDL cursor. Only works where the video driver draws cursors
+(X11, Wayland), not on fbdev or KMSDRM without a hardware cursor.
+---
+ Cargo.lock        |   1 +
+ sdl/Cargo.toml    |   1 +
+ sdl/src/cursor.rs | 600 ++++++++++++++++++++++++++++++++++++++++++++++
+ sdl/src/main.rs   |  22 +-
+ 4 files changed, 623 insertions(+), 1 deletion(-)
+ create mode 100644 sdl/src/cursor.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 44b31d93..28abcc91 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5169,6 +5169,7 @@ dependencies = [
+  "clap",
+  "futures",
+  "glow",
++ "png",
+  "ruffle_core",
+  "ruffle_frontend_utils",
+  "ruffle_render",
+diff --git a/sdl/Cargo.toml b/sdl/Cargo.toml
+index 7d7f8982..8612e439 100644
+--- a/sdl/Cargo.toml
++++ b/sdl/Cargo.toml
+@@ -20,6 +20,7 @@ ruffle_frontend_utils = { path = "../frontend-utils", default-features = false,
+ wgpu = { workspace = true }
+ wgpu-hal = { version = "30.0.1", features = ["gles"] }
+ glow = "0.17"
++png = { workspace = true }
+ sdl2 = "0.37"
+ tracing = { workspace = true }
+ tracing-subscriber = { workspace = true }
+diff --git a/sdl/src/cursor.rs b/sdl/src/cursor.rs
+new file mode 100644
+index 00000000..05fdafbb
+--- /dev/null
++++ b/sdl/src/cursor.rs
+@@ -0,0 +1,600 @@
++//! Software mouse cursor for ruffle_sdl (optional patch).
++//!
++//! ruffle_sdl hides the OS cursor, so a pointer driven by a gamepad (gptokeyb's right stick mouse,
++//! which is a uinput mouse and reaches SDL as MouseMotion) is invisible. Two remedies live here:
++//!
++//! 1. `SwCursor`: an arrow drawn by the front end as one GL quad on the window framebuffer, right
++//!    after the movie was blitted and before the buffer swap, in window (drawable) pixels, so it
++//!    works with --render-size and letterboxing. It shows after MouseMotion and hides after an idle
++//!    time. While hidden it costs nothing.
++//! 2. `install_sdl_cursor`: an SDL colour cursor built from the same bitmap (RUFFLE_SDL_CURSOR=1).
++//!    It only works where the video driver draws cursors (X11, Wayland), not on fbdev or KMSDRM
++//!    without a hardware cursor.
++//!
++//! Environment: RUFFLE_SW_CURSOR (0/1, default 0, or the --sw-cursor flag), RUFFLE_SW_CURSOR_IDLE_MS
++//! (default 2000), RUFFLE_SW_CURSOR_SIZE (pixels, default 24), RUFFLE_SW_CURSOR_IMAGE (PNG path),
++//! RUFFLE_SDL_CURSOR (0/1, default 0).
++//!
++//! The GL context belongs to wgpu, so every piece of state touched here is saved and restored.
++
++use glow::HasContext;
++use std::cell::{Cell, RefCell};
++use std::path::Path;
++use std::rc::Rc;
++use std::time::{Duration, Instant};
++
++const DEFAULT_SIZE: u32 = 24;
++const DEFAULT_IDLE_MS: u64 = 2000;
++
++/// An RGBA8 bitmap, straight alpha, row 0 on top. `hot` is the pixel that sits on the pointer.
++pub struct Bitmap {
++    pub width: u32,
++    pub height: u32,
++    pub rgba: Vec<u8>,
++    pub hot: (i32, i32),
++}
++
++fn env_flag(name: &str) -> bool {
++    std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
++}
++
++fn env_num<T: std::str::FromStr>(name: &str) -> Option<T> {
++    std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
++}
++
++/// True when RUFFLE_SW_CURSOR asks for the software cursor.
++pub fn sw_cursor_env() -> bool {
++    env_flag("RUFFLE_SW_CURSOR")
++}
++
++/// The bitmap both cursors use: RUFFLE_SW_CURSOR_IMAGE (PNG) if it loads, else the built in arrow.
++/// RUFFLE_SW_CURSOR_SIZE is the height in pixels of the arrow. An image keeps its own size unless
++/// the size variable is set, then it is scaled (nearest neighbour) to that height.
++pub fn bitmap() -> Bitmap {
++    let size = env_num::<u32>("RUFFLE_SW_CURSOR_SIZE").filter(|s| *s > 0);
++    if let Some(path) = std::env::var_os("RUFFLE_SW_CURSOR_IMAGE").filter(|p| !p.is_empty()) {
++        match load_png(Path::new(&path)) {
++            Ok(img) => {
++                return match size {
++                    Some(h) if h != img.height => scale(&img, h),
++                    _ => img,
++                };
++            }
++            Err(e) => {
++                tracing::warn!("RUFFLE_SW_CURSOR_IMAGE {path:?}: {e}; using the built in arrow")
++            }
++        }
++    }
++    arrow(size.unwrap_or(DEFAULT_SIZE).clamp(8, 256))
++}
++
++fn load_png(path: &Path) -> Result<Bitmap, String> {
++    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
++    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
++    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
++    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
++    let size = reader.output_buffer_size().ok_or("image too large")?;
++    let mut buf = vec![0u8; size];
++    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
++    let (w, h) = (info.width, info.height);
++    if w == 0 || h == 0 || w > 512 || h > 512 {
++        return Err(format!("{w}x{h} is not a sensible cursor size (max 512)"));
++    }
++    let px = (w * h) as usize;
++    let data = &buf[..info.buffer_size()];
++    let mut rgba = Vec::with_capacity(px * 4);
++    match info.color_type {
++        png::ColorType::Rgba => rgba.extend_from_slice(&data[..px * 4]),
++        png::ColorType::Rgb => {
++            for i in 0..px {
++                rgba.extend_from_slice(&[data[i * 3], data[i * 3 + 1], data[i * 3 + 2], 255]);
++            }
++        }
++        png::ColorType::GrayscaleAlpha => {
++            for i in 0..px {
++                rgba.extend_from_slice(&[data[i * 2], data[i * 2], data[i * 2], data[i * 2 + 1]]);
++            }
++        }
++        png::ColorType::Grayscale => data[..px]
++            .iter()
++            .for_each(|g| rgba.extend_from_slice(&[*g, *g, *g, 255])),
++        png::ColorType::Indexed => return Err("palette image was not expanded".into()),
++    }
++    Ok(Bitmap {
++        width: w,
++        height: h,
++        rgba,
++        hot: (0, 0),
++    })
++}
++
++fn scale(img: &Bitmap, new_h: u32) -> Bitmap {
++    let new_w = ((img.width as u64 * new_h as u64 / img.height as u64) as u32).max(1);
++    let mut rgba = Vec::with_capacity((new_w * new_h * 4) as usize);
++    for y in 0..new_h {
++        let sy = (y as u64 * img.height as u64 / new_h as u64) as usize;
++        for x in 0..new_w {
++            let sx = (x as u64 * img.width as u64 / new_w as u64) as usize;
++            let i = (sy * img.width as usize + sx) * 4;
++            rgba.extend_from_slice(&img.rgba[i..i + 4]);
++        }
++    }
++    Bitmap {
++        width: new_w,
++        height: new_h,
++        rgba,
++        hot: (
++            (img.hot.0 as i64 * new_w as i64 / img.width as i64) as i32,
++            (img.hot.1 as i64 * new_h as i64 / img.height as i64) as i32,
++        ),
++    }
++}
++
++/// The classic arrow, tip at the top left corner: white fill, black outline, anti aliased
++/// (4x4 supersampling). `size` is its height in pixels.
++fn arrow(size: u32) -> Bitmap {
++    // outline of the arrow in unit coordinates, tip at (0, 0), y down
++    const POLY: [(f32, f32); 7] = [
++        (0.0, 0.0),
++        (0.0, 0.80),
++        (0.18, 0.64),
++        (0.32, 0.96),
++        (0.46, 0.90),
++        (0.33, 0.59),
++        (0.57, 0.59),
++    ];
++    let h = size as f32;
++    let width = (size * 11 / 16).max(6);
++    // the outline is drawn inside and outside of the edge, this far
++    let half_line = (h / 24.0).max(0.7);
++    // the tip is moved in by the outline half width so the outline is not cut off
++    let off = half_line.ceil();
++    let scale = (h - 2.0 * off) / 0.96;
++    let poly: Vec<(f32, f32)> = POLY
++        .iter()
++        .map(|(x, y)| (x * scale + off, y * scale + off))
++        .collect();
++    let n = 4;
++    let mut rgba = vec![0u8; (width * size * 4) as usize];
++    for py in 0..size {
++        for px in 0..width {
++            let (mut white, mut black) = (0u32, 0u32);
++            for sy in 0..n {
++                for sx in 0..n {
++                    let x = px as f32 + (sx as f32 + 0.5) / n as f32;
++                    let y = py as f32 + (sy as f32 + 0.5) / n as f32;
++                    let (inside, d) = poly_probe(&poly, x, y);
++                    if d <= half_line {
++                        black += 1;
++                    } else if inside {
++                        white += 1;
++                    }
++                }
++            }
++            let covered = white + black;
++            if covered == 0 {
++                continue;
++            }
++            let v = (white * 255 / covered) as u8;
++            let a = (covered * 255 / (n * n)) as u8;
++            let i = ((py * width + px) * 4) as usize;
++            rgba[i..i + 4].copy_from_slice(&[v, v, v, a]);
++        }
++    }
++    Bitmap {
++        width,
++        height: size,
++        rgba,
++        hot: (off as i32, off as i32),
++    }
++}
++
++/// (is the point inside the polygon (even odd), distance to the polygon's outline)
++fn poly_probe(poly: &[(f32, f32)], x: f32, y: f32) -> (bool, f32) {
++    let mut inside = false;
++    let mut best = f32::MAX;
++    for i in 0..poly.len() {
++        let (x0, y0) = poly[i];
++        let (x1, y1) = poly[(i + 1) % poly.len()];
++        if (y0 > y) != (y1 > y) && x < (x1 - x0) * (y - y0) / (y1 - y0) + x0 {
++            inside = !inside;
++        }
++        let (dx, dy) = (x1 - x0, y1 - y0);
++        let t = (((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
++        let (cx, cy) = (x0 + t * dx - x, y0 + t * dy - y);
++        best = best.min((cx * cx + cy * cy).sqrt());
++    }
++    (inside, best)
++}
++
++/// RUFFLE_SDL_CURSOR=1: an SDL colour cursor (SDL_CreateColorCursor) from the same bitmap, shown
++/// through SDL. Keep the returned value alive for as long as the cursor should exist.
++pub fn install_sdl_cursor(sdl: &sdl2::Sdl) -> Option<sdl2::mouse::Cursor> {
++    if !env_flag("RUFFLE_SDL_CURSOR") {
++        return None;
++    }
++    let mut bmp = bitmap();
++    let hot = bmp.hot;
++    let pitch = bmp.width * 4;
++    let made = sdl2::surface::Surface::from_data(
++        &mut bmp.rgba,
++        bmp.width,
++        bmp.height,
++        pitch,
++        sdl2::pixels::PixelFormatEnum::RGBA32,
++    )
++    .and_then(|surface| sdl2::mouse::Cursor::from_surface(surface, hot.0, hot.1));
++    match made {
++        Ok(cursor) => {
++            cursor.set();
++            sdl.mouse().show_cursor(true);
++            tracing::info!("SDL colour cursor on (drawn by the video driver, if it can)");
++            Some(cursor)
++        }
++        Err(e) => {
++            tracing::warn!("RUFFLE_SDL_CURSOR: could not create the SDL cursor: {e}");
++            None
++        }
++    }
++}
++
++struct GlObjects {
++    program: glow::Program,
++    vao: glow::VertexArray,
++    texture: glow::Texture,
++    u_rect: Option<glow::UniformLocation>,
++    u_screen: Option<glow::UniformLocation>,
++    u_tex: Option<glow::UniformLocation>,
++}
++
++enum GlState {
++    Untried,
++    Ready(GlObjects),
++    Failed,
++}
++
++/// The software cursor. Shared between the main loop (events, wake ups) and the render target
++/// (drawing), single threaded, so plain `Cell`s.
++pub struct SwCursor {
++    gl: Rc<glow::Context>,
++    idle: Duration,
++    bitmap: Bitmap,
++    pos: Cell<(i32, i32)>,
++    last_motion: Cell<Option<Instant>>,
++    visible: Cell<bool>,
++    /// something changed since the last draw (moved, appeared, disappeared)
++    dirty: Cell<bool>,
++    objects: RefCell<GlState>,
++}
++
++impl SwCursor {
++    /// `None` unless RUFFLE_SW_CURSOR=1 or `flag` (the --sw-cursor flag).
++    pub fn from_env(gl: Rc<glow::Context>, flag: bool) -> Option<Rc<SwCursor>> {
++        if !(flag || sw_cursor_env()) {
++            return None;
++        }
++        let idle =
++            Duration::from_millis(env_num("RUFFLE_SW_CURSOR_IDLE_MS").unwrap_or(DEFAULT_IDLE_MS));
++        let bitmap = bitmap();
++        tracing::info!(
++            "software cursor on: {}x{} px, hides after {} ms idle",
++            bitmap.width,
++            bitmap.height,
++            idle.as_millis()
++        );
++        Some(Rc::new(SwCursor {
++            gl,
++            idle,
++            bitmap,
++            pos: Cell::new((0, 0)),
++            last_motion: Cell::new(None),
++            visible: Cell::new(false),
++            dirty: Cell::new(false),
++            objects: RefCell::new(GlState::Untried),
++        }))
++    }
++
++    /// A MouseMotion event, in window pixels.
++    pub fn moved(&self, x: i32, y: i32) {
++        self.pos.set((x, y));
++        self.last_motion.set(Some(Instant::now()));
++        self.visible.set(true);
++        self.dirty.set(true);
++    }
++
++    fn expire(&self) {
++        if self.visible.get()
++            && self
++                .last_motion
++                .get()
++                .is_some_and(|t| t.elapsed() >= self.idle)
++        {
++            self.visible.set(false);
++            self.dirty.set(true);
++        }
++    }
++
++    /// The frame needs to be drawn again (the cursor moved, appeared or went away) even if the
++    /// movie itself did not change.
++    pub fn wants_redraw(&self) -> bool {
++        self.expire();
++        self.dirty.get()
++    }
++
++    /// Time until the cursor has to be hidden (so the main loop wakes up), `None` when hidden.
++    pub fn deadline(&self) -> Option<Duration> {
++        if !self.visible.get() {
++            return None;
++        }
++        let t = self.last_motion.get()?;
++        Some(self.idle.saturating_sub(t.elapsed()))
++    }
++
++    /// Draw the arrow on the window framebuffer (the draw framebuffer must be the default one,
++    /// as it is right after the movie blit). Nothing happens while hidden.
++    pub fn draw(&self, screen: (u32, u32)) {
++        self.expire();
++        self.dirty.set(false);
++        if !self.visible.get() || screen.0 == 0 || screen.1 == 0 {
++            return;
++        }
++        if matches!(*self.objects.borrow(), GlState::Failed) {
++            return;
++        }
++        let gl = &*self.gl;
++        // SAFETY: plain GL calls on the context that is current on this thread; all touched
++        // state is read first and put back afterwards.
++        unsafe {
++            let saved = Saved::capture(gl);
++            if matches!(*self.objects.borrow(), GlState::Untried) {
++                let state = match self.create_objects() {
++                    Ok(o) => GlState::Ready(o),
++                    Err(e) => {
++                        tracing::error!("software cursor disabled: {e}");
++                        GlState::Failed
++                    }
++                };
++                *self.objects.borrow_mut() = state;
++            }
++            if let GlState::Ready(o) = &*self.objects.borrow() {
++                let (x, y) = self.pos.get();
++                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
++                gl.viewport(0, 0, screen.0 as i32, screen.1 as i32);
++                gl.disable(glow::SCISSOR_TEST);
++                gl.disable(glow::DEPTH_TEST);
++                gl.disable(glow::STENCIL_TEST);
++                gl.disable(glow::CULL_FACE);
++                gl.color_mask(true, true, true, true);
++                gl.enable(glow::BLEND);
++                gl.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
++                gl.blend_func_separate(
++                    glow::SRC_ALPHA,
++                    glow::ONE_MINUS_SRC_ALPHA,
++                    glow::ONE,
++                    glow::ONE_MINUS_SRC_ALPHA,
++                );
++                gl.use_program(Some(o.program));
++                gl.bind_vertex_array(Some(o.vao));
++                gl.active_texture(glow::TEXTURE0);
++                gl.bind_sampler(0, None);
++                gl.bind_texture(glow::TEXTURE_2D, Some(o.texture));
++                gl.uniform_4_f32(
++                    o.u_rect.as_ref(),
++                    (x - self.bitmap.hot.0) as f32,
++                    (y - self.bitmap.hot.1) as f32,
++                    self.bitmap.width as f32,
++                    self.bitmap.height as f32,
++                );
++                gl.uniform_2_f32(o.u_screen.as_ref(), screen.0 as f32, screen.1 as f32);
++                gl.uniform_1_i32(o.u_tex.as_ref(), 0);
++                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
++            }
++            saved.restore(gl);
++        }
++    }
++
++    /// Needs the saved state envelope of `draw` (texture binding and pixel unpack state).
++    unsafe fn create_objects(&self) -> Result<GlObjects, String> {
++        let gl = &*self.gl;
++        unsafe {
++            let program = gl.create_program()?;
++            let mut shaders = Vec::new();
++            for (kind, src) in [(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, FRAG)] {
++                let shader = gl.create_shader(kind)?;
++                gl.shader_source(shader, src);
++                gl.compile_shader(shader);
++                if !gl.get_shader_compile_status(shader) {
++                    let log = gl.get_shader_info_log(shader);
++                    gl.delete_shader(shader);
++                    gl.delete_program(program);
++                    return Err(format!("shader: {log}"));
++                }
++                gl.attach_shader(program, shader);
++                shaders.push(shader);
++            }
++            gl.link_program(program);
++            for s in shaders {
++                gl.detach_shader(program, s);
++                gl.delete_shader(s);
++            }
++            if !gl.get_program_link_status(program) {
++                let log = gl.get_program_info_log(program);
++                gl.delete_program(program);
++                return Err(format!("program: {log}"));
++            }
++            let vao = gl.create_vertex_array()?;
++            let texture = gl.create_texture()?;
++            gl.active_texture(glow::TEXTURE0);
++            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
++            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
++            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
++            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
++            gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
++            gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
++            gl.tex_image_2d(
++                glow::TEXTURE_2D,
++                0,
++                glow::RGBA8 as i32,
++                self.bitmap.width as i32,
++                self.bitmap.height as i32,
++                0,
++                glow::RGBA,
++                glow::UNSIGNED_BYTE,
++                glow::PixelUnpackData::Slice(Some(&self.bitmap.rgba)),
++            );
++            gl.tex_parameter_i32(
++                glow::TEXTURE_2D,
++                glow::TEXTURE_MIN_FILTER,
++                glow::LINEAR as i32,
++            );
++            gl.tex_parameter_i32(
++                glow::TEXTURE_2D,
++                glow::TEXTURE_MAG_FILTER,
++                glow::LINEAR as i32,
++            );
++            gl.tex_parameter_i32(
++                glow::TEXTURE_2D,
++                glow::TEXTURE_WRAP_S,
++                glow::CLAMP_TO_EDGE as i32,
++            );
++            gl.tex_parameter_i32(
++                glow::TEXTURE_2D,
++                glow::TEXTURE_WRAP_T,
++                glow::CLAMP_TO_EDGE as i32,
++            );
++            Ok(GlObjects {
++                u_rect: gl.get_uniform_location(program, "u_rect"),
++                u_screen: gl.get_uniform_location(program, "u_screen"),
++                u_tex: gl.get_uniform_location(program, "u_tex"),
++                program,
++                vao,
++                texture,
++            })
++        }
++    }
++}
++
++const VERT: &str = "#version 300 es
++uniform vec4 u_rect;
++uniform vec2 u_screen;
++out vec2 v_uv;
++void main() {
++    vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
++    v_uv = c;
++    vec2 p = u_rect.xy + c * u_rect.zw;
++    gl_Position = vec4(p.x / u_screen.x * 2.0 - 1.0, 1.0 - p.y / u_screen.y * 2.0, 0.0, 1.0);
++}
++";
++
++const FRAG: &str = "#version 300 es
++precision mediump float;
++uniform sampler2D u_tex;
++in vec2 v_uv;
++out vec4 o_color;
++void main() {
++    o_color = texture(u_tex, v_uv);
++}
++";
++
++/// The GL state the cursor draw touches, as wgpu left it.
++struct Saved {
++    draw_fbo: Option<glow::Framebuffer>,
++    program: Option<glow::Program>,
++    vao: Option<glow::VertexArray>,
++    unpack_buffer: Option<glow::Buffer>,
++    active_texture: u32,
++    texture: Option<glow::Texture>,
++    sampler: Option<glow::Sampler>,
++    viewport: [i32; 4],
++    scissor: bool,
++    depth: bool,
++    stencil: bool,
++    cull: bool,
++    blend: bool,
++    blend_func: [u32; 4],
++    blend_eq: [u32; 2],
++    color_mask: [bool; 4],
++    unpack: [i32; 4],
++}
++
++impl Saved {
++    unsafe fn capture(gl: &glow::Context) -> Saved {
++        unsafe {
++            let mut viewport = [0i32; 4];
++            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
++            let active_texture = gl.get_parameter_i32(glow::ACTIVE_TEXTURE) as u32;
++            // texture and sampler of unit 0 are the ones we touch
++            gl.active_texture(glow::TEXTURE0);
++            let s = Saved {
++                draw_fbo: gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING),
++                program: gl.get_parameter_program(glow::CURRENT_PROGRAM),
++                vao: gl.get_parameter_vertex_array(glow::VERTEX_ARRAY_BINDING),
++                unpack_buffer: gl.get_parameter_buffer(glow::PIXEL_UNPACK_BUFFER_BINDING),
++                active_texture,
++                texture: gl.get_parameter_texture(glow::TEXTURE_BINDING_2D),
++                sampler: gl.get_parameter_sampler(glow::SAMPLER_BINDING),
++                viewport,
++                scissor: gl.is_enabled(glow::SCISSOR_TEST),
++                depth: gl.is_enabled(glow::DEPTH_TEST),
++                stencil: gl.is_enabled(glow::STENCIL_TEST),
++                cull: gl.is_enabled(glow::CULL_FACE),
++                blend: gl.is_enabled(glow::BLEND),
++                blend_func: [
++                    gl.get_parameter_i32(glow::BLEND_SRC_RGB) as u32,
++                    gl.get_parameter_i32(glow::BLEND_DST_RGB) as u32,
++                    gl.get_parameter_i32(glow::BLEND_SRC_ALPHA) as u32,
++                    gl.get_parameter_i32(glow::BLEND_DST_ALPHA) as u32,
++                ],
++                blend_eq: [
++                    gl.get_parameter_i32(glow::BLEND_EQUATION_RGB) as u32,
++                    gl.get_parameter_i32(glow::BLEND_EQUATION_ALPHA) as u32,
++                ],
++                color_mask: gl.get_parameter_bool_array::<4>(glow::COLOR_WRITEMASK),
++                unpack: [
++                    gl.get_parameter_i32(glow::UNPACK_ALIGNMENT),
++                    gl.get_parameter_i32(glow::UNPACK_ROW_LENGTH),
++                    gl.get_parameter_i32(glow::UNPACK_SKIP_ROWS),
++                    gl.get_parameter_i32(glow::UNPACK_SKIP_PIXELS),
++                ],
++            };
++            gl.active_texture(active_texture);
++            s
++        }
++    }
++
++    unsafe fn restore(&self, gl: &glow::Context) {
++        fn set(gl: &glow::Context, cap: u32, on: bool) {
++            unsafe { if on { gl.enable(cap) } else { gl.disable(cap) } }
++        }
++        unsafe {
++            gl.active_texture(glow::TEXTURE0);
++            gl.bind_texture(glow::TEXTURE_2D, self.texture);
++            gl.bind_sampler(0, self.sampler);
++            gl.active_texture(self.active_texture);
++            gl.bind_vertex_array(self.vao);
++            gl.use_program(self.program);
++            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, self.unpack_buffer);
++            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, self.unpack[0]);
++            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, self.unpack[1]);
++            gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, self.unpack[2]);
++            gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, self.unpack[3]);
++            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, self.draw_fbo);
++            let v = self.viewport;
++            gl.viewport(v[0], v[1], v[2], v[3]);
++            set(gl, glow::SCISSOR_TEST, self.scissor);
++            set(gl, glow::DEPTH_TEST, self.depth);
++            set(gl, glow::STENCIL_TEST, self.stencil);
++            set(gl, glow::CULL_FACE, self.cull);
++            set(gl, glow::BLEND, self.blend);
++            gl.blend_equation_separate(self.blend_eq[0], self.blend_eq[1]);
++            gl.blend_func_separate(
++                self.blend_func[0],
++                self.blend_func[1],
++                self.blend_func[2],
++                self.blend_func[3],
++            );
++            let m = self.color_mask;
++            gl.color_mask(m[0], m[1], m[2], m[3]);
++        }
++    }
++}
+diff --git a/sdl/src/main.rs b/sdl/src/main.rs
+index bbaf75c2..a206b943 100644
+--- a/sdl/src/main.rs
++++ b/sdl/src/main.rs
+@@ -6,6 +6,7 @@
+ //! Everything runs on the main thread, as GL needs with an external context.
+ 
+ mod audio;
++mod cursor;
+ mod keys;
+ 
+ use anyhow::{Context as _, anyhow};
+@@ -75,6 +76,11 @@ struct Opt {
+     /// letterbox bars; "movie" = the movie's own scale mode and alignment, no letterbox
+     #[clap(long, default_value = "fit", value_parser(["fit", "movie"]))]
+     stage_scale: String,
++
++    /// Draw a software mouse cursor (an arrow) after mouse motion, hidden after an idle time
++    /// (same as RUFFLE_SW_CURSOR=1)
++    #[clap(long)]
++    sw_cursor: bool,
+ }
+ 
+ fn parse_parameter(s: &str) -> Result<(String, String), String> {
+@@ -99,6 +105,8 @@ struct SdlTarget {
+     /// Window size, the blit's destination
+     screen: Rc<Cell<(u32, u32)>>,
+     read_fbo: Cell<Option<(glow::Framebuffer, glow::Texture)>>,
++    /// Software mouse cursor, drawn after the blit
++    cursor: Option<Rc<cursor::SwCursor>>,
+ }
+ 
+ impl std::fmt::Debug for SdlTarget {
+@@ -211,6 +219,9 @@ impl SdlTarget {
+             );
+             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+         }
++        if let Some(cursor) = &self.cursor {
++            cursor.draw(self.screen.get());
++        }
+     }
+ }
+ 
+@@ -353,6 +364,7 @@ fn main() -> anyhow::Result<()> {
+         .map_err(|e| anyhow!(e))?;
+     let _ = video.gl_set_swap_interval(1);
+     sdl.mouse().show_cursor(false);
++    let _sdl_cursor = cursor::install_sdl_cursor(&sdl);
+     let (width, height) = window.drawable_size();
+     let screen = Rc::new(Cell::new((width, height)));
+ 
+@@ -382,6 +394,7 @@ fn main() -> anyhow::Result<()> {
+     let (device, queue) = futures::executor::block_on(request_device(&adapter))?;
+     let descriptors = Arc::new(Descriptors::new(instance, adapter, device, queue));
+ 
++    let sw_cursor = cursor::SwCursor::from_env(gl.clone(), opt.sw_cursor);
+     let (rw, rh) = opt.render_size.unwrap_or((width, height));
+     let target = SdlTarget {
+         gl,
+@@ -390,6 +403,7 @@ fn main() -> anyhow::Result<()> {
+         height: rh,
+         screen: screen.clone(),
+         read_fbo: Cell::new(None),
++        cursor: sw_cursor.clone(),
+     };
+     let renderer =
+         WgpuRenderBackend::new(descriptors, target).map_err(|e| anyhow!(e.to_string()))?;
+@@ -512,6 +526,9 @@ fn main() -> anyhow::Result<()> {
+             });
+         }
+         let mut wait = next_frame.saturating_duration_since(Instant::now());
++        if let Some(due) = sw_cursor.as_ref().and_then(|c| c.deadline()) {
++            wait = wait.min(due);
++        }
+         if let Some((due, _, _)) = held_ups.iter().min_by_key(|(due, _, _)| *due) {
+             wait = wait.min(due.saturating_duration_since(Instant::now()));
+         }
+@@ -572,6 +589,9 @@ fn main() -> anyhow::Result<()> {
+                     continue;
+                 }
+                 Event::MouseMotion { x, y, .. } => {
++                    if let Some(cursor) = &sw_cursor {
++                        cursor.moved(x, y);
++                    }
+                     let (x, y) = to_movie(x, y);
+                     PlayerEvent::MouseMove { x, y }
+                 }
+@@ -645,7 +665,7 @@ fn main() -> anyhow::Result<()> {
+             }
+             next_frame = now + player.time_til_next_frame();
+             timing.0 += t1 - t0;
+-            if player.needs_render() {
++            if player.needs_render() || sw_cursor.as_ref().is_some_and(|c| c.wants_redraw()) {
+                 player.render();
+                 drop(player);
+                 let t2 = Instant::now();
+-- 
+2.55.0
+

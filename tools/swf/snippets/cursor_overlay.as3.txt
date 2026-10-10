@@ -1,0 +1,99 @@
+// Software cursor overlay (AS3 shell)
+//
+// Status: tested headless. The members below were compiled into the document class of a minimal
+// AS3 movie with ffdec (replace-as3) and run in ruffle_sdl on Xvfb by tests/cursor_test.sh: the
+// arrow appears under a pointer moved with xdotool, and is gone again after the idle time (pixel
+// comparison). Not tried on a real shell or on a device.
+//
+// Why: ruffle_sdl hides the system cursor, so a pointer driven by a gamepad (gptokeyb right stick
+// mouse) cannot be seen. This adds a small arrow Sprite as the topmost child of the stage, moves
+// it with the mouse, shows it on MOUSE_MOVE and hides it again after an idle time. It needs no
+// front end patch. The other options are the front end overlay (optional patch 0100) and the
+// SDL colour cursor, see docs/09-input.md.
+//
+// Needs:
+//   import flash.display.Shape;
+//   import flash.display.Sprite;
+//   import flash.display.Stage;
+//   import flash.events.MouseEvent;
+//   import flash.events.TimerEvent;
+//   import flash.ui.Mouse;
+//   import flash.utils.Timer;
+//   import flash.utils.getTimer;
+//
+// Add the members below to the shell's document class (or any class that has a `stage`), and call
+// installCursorOverlay() once, after the stage exists (the document class constructor, or the
+// ADDED_TO_STAGE handler). With tools/swf/anchor.py, anchor on the end of the constructor and on
+// the end of the class and add them with Patch.sub(), then recompile with
+//   tools/swf/ffdec.sh replace-as3 in.swf out.swf <DocumentClass> patched/<DocumentClass>.as
+//
+// mouseEnabled and mouseChildren are false, so the arrow never takes or blocks a click.
+// Mouse.hide() is kept for desktop players, ruffle_sdl already hides the system cursor.
+
+private var cursorSprite:Sprite;
+private var cursorTimer:Timer;
+private var cursorLastMove:int = 0;
+private const CURSOR_IDLE_MS:int = 2000;     // hide after this long without motion
+
+private function installCursorOverlay() : void
+{
+   Mouse.hide();
+
+   var arrow:Shape = new Shape();
+   arrow.graphics.lineStyle(1, 0x000000, 1);
+   arrow.graphics.beginFill(0xFFFFFF, 1);
+   arrow.graphics.moveTo(0, 0);
+   arrow.graphics.lineTo(0, 17);
+   arrow.graphics.lineTo(4, 13);
+   arrow.graphics.lineTo(7, 20);
+   arrow.graphics.lineTo(10, 19);
+   arrow.graphics.lineTo(7, 12);
+   arrow.graphics.lineTo(12, 12);
+   arrow.graphics.lineTo(0, 0);
+   arrow.graphics.endFill();
+
+   cursorSprite = new Sprite();
+   cursorSprite.mouseEnabled = false;
+   cursorSprite.mouseChildren = false;
+   cursorSprite.visible = false;
+   cursorSprite.addChild(arrow);
+   stage.addChild(cursorSprite);
+
+   stage.addEventListener(MouseEvent.MOUSE_MOVE, onCursorMove, false, 0, true);
+
+   cursorTimer = new Timer(100);
+   cursorTimer.addEventListener(TimerEvent.TIMER, onCursorTimer);
+   cursorTimer.start();
+}
+
+private function onCursorMove(e:MouseEvent) : void
+{
+   // e.stageX and e.stageY belong to this event. stage.mouseX can still hold the previous
+   // event's position inside the handler in Ruffle.
+   cursorSprite.x = e.stageX;
+   cursorSprite.y = e.stageY;
+   cursorSprite.visible = true;
+   cursorLastMove = getTimer();
+   // keep the arrow on top when the game added children to the stage since
+   if (stage.getChildIndex(cursorSprite) != stage.numChildren - 1)
+   {
+      stage.setChildIndex(cursorSprite, stage.numChildren - 1);
+   }
+}
+
+private function onCursorTimer(e:TimerEvent) : void
+{
+   if (cursorSprite.visible && getTimer() - cursorLastMove > CURSOR_IDLE_MS)
+   {
+      cursorSprite.visible = false;
+   }
+}
+
+// Notes
+//  * stage.mouseX and stage.mouseY are in stage coordinates. With ruffle_sdl's stage_scale "fit"
+//    the stage is already scaled to the screen, so the arrow lands under the pointer.
+//  * stage.addChild works because the stage is a display object container. Some shells forbid
+//    it (a loader security sandbox); add to the document class instead and move to its top.
+//  * If the shell sets stage.mouseChildren = false or intercepts MOUSE_MOVE in capture phase
+//    with stopImmediatePropagation, the bubbling listener above never fires. Use the capture
+//    phase: stage.addEventListener(MouseEvent.MOUSE_MOVE, onCursorMove, true) in that case.
