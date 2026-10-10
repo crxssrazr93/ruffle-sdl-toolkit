@@ -26,6 +26,7 @@ These were contributed through pull request #1 on the example repository (see `e
 ### crxssrazr93
 
 * Ruffle patches 0001 to 0004 (readGraphicsData, Stage3D batching and caches, GPU side texture uploads and the AS3 profiler, lazy mouse picking and frame skipping) and 0013 (minimum key hold). Patches 0002 and 0006 were lightly edited after export by crxssrazr93 (generic relaunch marker name and neutral prose, author lines untouched)
+* the optional software cursor patch 0100 (front end overlay and SDL colour cursor) and the shell side cursor snippets
 * the shell and SWF patching tools, the ATF decoder tool, the delivery scripts, the relaunch wrapper, the launcher, patchscript and cfg templates
 * the test harnesses, the capture hook script and the device helpers
 * the documentation
